@@ -206,6 +206,14 @@ bool OmniController::handleSerialFlashCommand(const String& line) {
         return true;
     }
 
+    // Best-effort RX buffer bump. Arduino-ESP32 v3 HWCDC ignores this once
+    // begin() has been called (which happens at boot when ARDUINO_USB_CDC_ON_BOOT=1),
+    // so this typically returns false. The actual buffer size is set via the
+    // build-flag CONFIG_TINYUSB_CDC_RX_BUFSIZE (see platformio.ini). The call
+    // is here so that if a future framework version honours runtime resize,
+    // we'd benefit automatically.
+    HWCDCSerial.setRxBufferSize(16384);
+
     Serial.println("OMNI_C6_READY");
     Serial.flush();
 
@@ -219,9 +227,10 @@ bool OmniController::handleSerialFlashCommand(const String& line) {
     uint32_t runningCrc = 0;
     uint32_t received = 0;
     uint32_t lastByteMs = millis();
+    uint32_t lastProgressLog = 0;
 
     while (received < size) {
-        if (millis() - lastByteMs > 10000) {
+        if (millis() - lastByteMs > 15000) {
             _flasher.flashAbort();
             Serial.printf("OMNI_C6_FLASH_ERR rx_timeout %u_of_%u\n",
                           (unsigned)received, (unsigned)size);
@@ -250,6 +259,15 @@ bool OmniController::handleSerialFlashCommand(const String& line) {
         }
         received += got;
         lastByteMs = millis();
+
+        // Progress log every ~32 KB. Diagnostic only — PC client filters
+        // anything that's not OMNI_C6_*. Helps us see where stalls happen.
+        if (received - lastProgressLog >= 32 * 1024 || received == size) {
+            Serial.printf("OmniSerial: rx %u/%u (%u%%)\n",
+                          (unsigned)received, (unsigned)size,
+                          (unsigned)((uint64_t)received * 100 / size));
+            lastProgressLog = received;
+        }
     }
 
     if (runningCrc != expectedCrc) {

@@ -188,11 +188,14 @@ bool OmniUartFlasher::flashBegin(uint32_t imageSize, uint32_t flashOffset) {
     }
     Serial.println("OmniUartFlasher: stub uploaded");
 
-    err = esp_loader_change_transmission_rate(kFlasherFastBaud);
+    // After connect_with_stub the stub is loaded — use the stub-aware
+    // baud-change function (the ROM-mode variant returns UNSUPPORTED_FUNC
+    // post-stub).
+    err = esp_loader_change_transmission_rate_stub(kFlasherBaudRate, kFlasherFastBaud);
     if (err != ESP_LOADER_SUCCESS) {
-        Serial.printf("OmniUartFlasher: change_transmission_rate(%lu) failed (%d), staying at %lu\n",
-                      (unsigned long)kFlasherFastBaud, (int)err, (unsigned long)kFlasherBaudRate);
-        // Non-fatal — keep going at the original baud rate.
+        Serial.printf("OmniUartFlasher: change_transmission_rate_stub(%lu->%lu) failed (%d), staying at %lu\n",
+                      (unsigned long)kFlasherBaudRate, (unsigned long)kFlasherFastBaud,
+                      (int)err, (unsigned long)kFlasherBaudRate);
     } else {
         Serial.printf("OmniUartFlasher: bumped to %lu baud\n", (unsigned long)kFlasherFastBaud);
     }
