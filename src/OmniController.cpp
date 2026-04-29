@@ -2,7 +2,6 @@
 
 #include <ArduinoJson.h>
 #include <esp_rom_crc.h>
-#include <esp_heap_caps.h>
 
 #include "OmniProto.h"
 
@@ -199,22 +198,31 @@ bool OmniController::handleSerialFlashCommand(const String& line) {
         return true;
     }
 
-    uint8_t* buf = (uint8_t*)heap_caps_malloc(size, MALLOC_CAP_SPIRAM);
-    if (!buf) {
-        Serial.printf("OMNI_C6_FLASH_ERR oom %u\n", (unsigned)size);
+    // Open the flash session before signalling READY — that way the C6 enters
+    // bootloader mode and the stub uploads while the PC is still preparing
+    // its stream. flashBegin can take a couple of seconds; do it first.
+    if (!_flasher.flashBegin(size, 0x0)) {
+        Serial.printf("OMNI_C6_FLASH_ERR begin %d\n", (int)_flasher.lastFlashError());
         return true;
     }
 
     Serial.println("OMNI_C6_READY");
     Serial.flush();
 
-    // Tight loop: drain Serial until full size received or timeout. Blocking the
-    // main loop is acceptable; AsyncTCP/WiFi run on Core 0 and keep ticking.
+    // Streaming pipeline: read a chunk from USB-CDC, accumulate CRC32, hand
+    // straight to flashWrite. No buffering of the whole image — works without
+    // PSRAM and keeps the stack budget tiny. USB-CDC backpressures the host
+    // so the host's send rate naturally matches our flashWrite throughput
+    // (~46 KB/s at 460800 baud once the stub is loaded).
+    constexpr uint32_t kChunkSize = 4096;
+    static uint8_t chunk[kChunkSize];   // static to keep it off a small task stack
+    uint32_t runningCrc = 0;
     uint32_t received = 0;
     uint32_t lastByteMs = millis();
+
     while (received < size) {
         if (millis() - lastByteMs > 10000) {
-            free(buf);
+            _flasher.flashAbort();
             Serial.printf("OMNI_C6_FLASH_ERR rx_timeout %u_of_%u\n",
                           (unsigned)received, (unsigned)size);
             return true;
@@ -225,49 +233,40 @@ bool OmniController::handleSerialFlashCommand(const String& line) {
             continue;
         }
         uint32_t toRead = (uint32_t)avail;
+        if (toRead > kChunkSize) toRead = kChunkSize;
         if (toRead > (size - received)) toRead = size - received;
-        size_t got = Serial.readBytes((char*)(buf + received), toRead);
+
+        size_t got = Serial.readBytes((char*)chunk, toRead);
+        if (got == 0) {
+            yield();
+            continue;
+        }
+        runningCrc = esp_rom_crc32_le(runningCrc, chunk, got);
+        if (!_flasher.flashWrite(chunk, (uint32_t)got)) {
+            _flasher.flashAbort();
+            Serial.printf("OMNI_C6_FLASH_ERR write %d at_offset=%u\n",
+                          (int)_flasher.lastFlashError(), (unsigned)received);
+            return true;
+        }
         received += got;
         lastByteMs = millis();
     }
 
-    uint32_t actualCrc = esp_rom_crc32_le(0, buf, size);
-    if (actualCrc != expectedCrc) {
-        free(buf);
+    if (runningCrc != expectedCrc) {
+        _flasher.flashAbort();
         Serial.printf("OMNI_C6_CRC_FAIL expected=%08x actual=%08x size=%u\n",
-                      (unsigned)expectedCrc, (unsigned)actualCrc, (unsigned)size);
+                      (unsigned)expectedCrc, (unsigned)runningCrc, (unsigned)size);
         return true;
     }
     Serial.printf("OMNI_C6_RX_OK %u bytes crc=%08x\n",
-                  (unsigned)size, (unsigned)actualCrc);
+                  (unsigned)size, (unsigned)runningCrc);
     Serial.flush();
 
-    // Hand the buffered image to the existing UART flasher session machinery.
-    if (!_flasher.flashBegin(size, 0x0)) {
-        free(buf);
-        Serial.printf("OMNI_C6_FLASH_ERR begin %d\n", (int)_flasher.lastFlashError());
-        return true;
-    }
-
-    constexpr uint32_t kStreamChunk = 4096;
-    for (uint32_t off = 0; off < size; off += kStreamChunk) {
-        uint32_t n = (off + kStreamChunk <= size) ? kStreamChunk : (size - off);
-        if (!_flasher.flashWrite(buf + off, n)) {
-            _flasher.flashAbort();
-            free(buf);
-            Serial.printf("OMNI_C6_FLASH_ERR write %d at_offset=%u\n",
-                          (int)_flasher.lastFlashError(), (unsigned)off);
-            return true;
-        }
-    }
-
     if (!_flasher.flashFinish(true /*reboot*/)) {
-        free(buf);
         Serial.printf("OMNI_C6_FLASH_ERR finish %d\n", (int)_flasher.lastFlashError());
         return true;
     }
 
-    free(buf);
     Serial.printf("OMNI_C6_FLASH_OK size=%u flash_ms=%u\n",
                   (unsigned)size, (unsigned)_flasher.lastFlashMs());
     return true;
