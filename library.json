@@ -1,6 +1,6 @@
 {
     "name": "OmniController",
-    "version": "0.1.0",
+    "version": "0.2.0",
     "description": "Local-first IoT omni-controller. Discovers and controls smart-home devices over WiFi/BLE/Zigbee/Thread/Matter via an ESP32-S3 + ESP32-C6 architecture.",
     "keywords": "esp32, iot, zigbee, thread, matter, mdns, ssdp, ble, smarthome",
     "repository": {
@@ -21,5 +21,19 @@
             "name": "ArduinoJson",
             "version": "^7"
         }
-    ]
+    ],
+    "build": {
+        "srcFilter": [
+            "+<*>",
+            "+<../external/esp-serial-flasher/src/md5_hash.c>",
+            "+<../external/esp-serial-flasher/src/esp_loader.c>",
+            "+<../external/esp-serial-flasher/src/protocol_serial.c>",
+            "+<../external/esp-serial-flasher/src/esp_targets.c>",
+            "+<../external/esp-serial-flasher/src/esp_stubs.c>",
+            "+<../external/esp-serial-flasher/src/protocol_uart.c>",
+            "+<../external/esp-serial-flasher/src/slip.c>",
+            "+<../external/esp-serial-flasher/port/esp32_port.c>"
+        ],
+        "extraScript": "library_extra.py"
+    }
 }

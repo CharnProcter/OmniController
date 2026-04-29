@@ -22,14 +22,22 @@ enum class FlasherAction : uint8_t {
     None       = 0,
     Reset      = 1,
     Bootloader = 2,
-    Flashing   = 3,  // reserved for M-β.2
+    Probe      = 3,  // M-β.2 smoke test — connect, read chip ID, disconnect
+    Flashing   = 4,  // reserved for M-β.2 part B
 };
 
 const char* flasherActionName(FlasherAction a);
 
+struct ProbeResult {
+    bool        ok;
+    int32_t     errorCode;     // raw esp_loader_error_t cast to int (0 = success)
+    const char* chipName;      // resolved chip name (e.g. "ESP32-C6"), or "unknown"
+    uint32_t    durationMs;
+};
+
 class OmniUartFlasher {
 public:
-    void begin(uint8_t enPin, uint8_t bootPin);
+    void begin(uint8_t enPin, uint8_t bootPin, uint8_t uartTxPin, uint8_t uartRxPin);
 
     // Pulse EN low to reset the C6 into normal application mode.
     void resetTarget();
@@ -38,23 +46,34 @@ public:
     // Caller is responsible for any subsequent flash protocol (M-β.2).
     void enterBootloader();
 
-    // Status accessors for the /omni/c6/status endpoint.
+    // M-β.2 smoke test: enter bootloader, run esp-serial-flasher's connect
+    // handshake, query the target chip ID, deinit, return result. Intended
+    // to verify the integration links and the protocol speaks to the C6
+    // before wiring the full /omniC6Ota flash flow.
+    ProbeResult probeC6Target();
+
+    // Status accessors.
     FlasherAction lastAction() const { return _lastAction; }
     uint32_t      lastActionMs() const { return _lastActionMs; }
     bool          began() const { return _began; }
     uint8_t       enPin() const { return _enPin; }
     uint8_t       bootPin() const { return _bootPin; }
+    uint8_t       uartTxPin() const { return _uartTxPin; }
+    uint8_t       uartRxPin() const { return _uartRxPin; }
 
 private:
     void driveEnLow();
     void releaseEn();
     void driveBootLow();
     void releaseBoot();
+    void releaseStrapPins();
     void recordAction(FlasherAction a);
 
-    uint8_t _enPin   = 0;
-    uint8_t _bootPin = 0;
-    bool    _began   = false;
+    uint8_t _enPin     = 0;
+    uint8_t _bootPin   = 0;
+    uint8_t _uartTxPin = 0;
+    uint8_t _uartRxPin = 0;
+    bool    _began     = false;
     FlasherAction _lastAction = FlasherAction::None;
     uint32_t      _lastActionMs = 0;
 };

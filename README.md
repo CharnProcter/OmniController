@@ -4,6 +4,16 @@ Local-first IoT omni-controller for the AutomationPlatform. Pairs an ESP32-S3 (W
 
 The S3 cannot do 802.15.4. The C6 can. The two share a SPI link plus a UART used for bootstrap flashing of the C6.
 
+## Submodule init (one-time)
+
+This library bundles Espressif's `esp-serial-flasher` v1.11.0 as a git submodule under `external/esp-serial-flasher`. After cloning (or pulling the first commit that adds it), run:
+
+```
+git submodule update --init --recursive
+```
+
+If you skip this, the submodule directory will be empty and the build will fail with `esp_loader.h: No such file or directory`. The submodule is required for the UART-based C6 flasher (M-β.2 onwards).
+
 ## Hardware contract (from `AutomationPlatformPlus`)
 
 | Function       | S3 GPIO | Notes                                                                 |

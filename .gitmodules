@@ -1,0 +1,4 @@
+[submodule "external/esp-serial-flasher"]
+	path = external/esp-serial-flasher
+	url = https://github.com/espressif/esp-serial-flasher
+	branch = master

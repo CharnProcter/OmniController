@@ -12,7 +12,7 @@ bool OmniController::begin(FlexibleEndpoints* endpoints, const OmniPins& pins) {
     if (_began) return true;
 
     _pins = pins;
-    _flasher.begin(_pins.en, _pins.boot);
+    _flasher.begin(_pins.en, _pins.boot, _pins.uart_tx, _pins.uart_rx);
 
     if (endpoints) {
         registerEndpoints(endpoints);
@@ -136,4 +136,29 @@ void OmniController::registerEndpoints(FlexibleEndpoints* endpoints) {
             return std::pair<String, int>(out, 200);
         });
     endpoints->addEndpoint(c6BootloaderEndpoint);
+
+    auto c6ProbeEndpoint = FLEXIBLE_ENDPOINT()
+        .route("/omniC6Probe")
+        .summary("Probe the C6 over UART via esp-serial-flasher")
+        .description("M-beta.2 smoke test. Drives the C6 into ROM bootloader mode, runs "
+                     "the esp-serial-flasher SYNC handshake, and reads back the chip ID. "
+                     "Used to verify the integration links and that the protocol speaks "
+                     "to the C6 before wiring the full /omniC6Ota flash workflow. "
+                     "Takes ~1-2 seconds; the C6 is left in bootloader state and should "
+                     "be reset (/omniC6Reset) afterwards if the application is needed.")
+        .params({})
+        .responseType(JSON_RESPONSE)
+        .responseDescription("JSON probe result with chip name and timing")
+        .handler([self](std::map<String, String>& /*params*/) -> std::pair<String, int> {
+            auto r = self->_flasher.probeC6Target();
+            JsonDocument doc;
+            doc["ok"] = r.ok;
+            doc["error_code"] = r.errorCode;
+            doc["chip"] = r.chipName;
+            doc["duration_ms"] = r.durationMs;
+            String out;
+            serializeJson(doc, out);
+            return std::pair<String, int>(out, r.ok ? 200 : 502);
+        });
+    endpoints->addEndpoint(c6ProbeEndpoint);
 }
