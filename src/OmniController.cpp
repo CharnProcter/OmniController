@@ -2,15 +2,16 @@
 
 #include <ArduinoJson.h>
 
-#include "AutomationPlatformPlus.h"
 #include "OmniProto.h"
 
 #ifndef OMNI_S3_FW_VERSION
 #define OMNI_S3_FW_VERSION "omni-0.1.0"
 #endif
 
-bool OmniController::begin(FlexibleEndpoints* endpoints) {
+bool OmniController::begin(FlexibleEndpoints* endpoints, const OmniPins& pins) {
     if (_began) return true;
+
+    _pins = pins;
 
     if (endpoints) {
         registerEndpoints(endpoints);
@@ -23,14 +24,14 @@ bool OmniController::begin(FlexibleEndpoints* endpoints) {
 
 std::vector<uint8_t> OmniController::getUsedPins() const {
     return {
-        C6_EN,
-        C6_BOOT,
-        LINK_SPI_CSn,
-        LINK_SPI_MOSI,
-        LINK_SPI_CLK,
-        LINK_SPI_MISO,
-        C6_UART_TX,
-        C6_UART_RX,
+        _pins.en,
+        _pins.boot,
+        _pins.spi_cs,
+        _pins.spi_mosi,
+        _pins.spi_miso,
+        _pins.spi_clk,
+        _pins.uart_tx,
+        _pins.uart_rx,
     };
 }
 
