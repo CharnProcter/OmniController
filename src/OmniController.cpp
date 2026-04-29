@@ -43,7 +43,7 @@ void OmniController::registerEndpoints(FlexibleEndpoints* endpoints) {
     endpoints->setLibraryName("Status");
 
     auto statusEndpoint = FLEXIBLE_ENDPOINT()
-        .route("/omni/status")
+        .route("/omniStatus")
         .summary("OmniController status")
         .description("Returns current OmniController state: firmware version, wire protocol "
                      "version, registered drivers, and module readiness. Used by the "
@@ -68,7 +68,7 @@ void OmniController::registerEndpoints(FlexibleEndpoints* endpoints) {
     endpoints->setLibraryName("C6 Link");
 
     auto c6StatusEndpoint = FLEXIBLE_ENDPOINT()
-        .route("/omni/c6/status")
+        .route("/omniC6Status")
         .summary("C6 daughterboard link status")
         .description("Returns current C6 link state: pin assignments, last manual action "
                      "(reset / bootloader / flash) with timestamp. M-gamma adds SPI link "
@@ -97,7 +97,7 @@ void OmniController::registerEndpoints(FlexibleEndpoints* endpoints) {
     endpoints->addEndpoint(c6StatusEndpoint);
 
     auto c6ResetEndpoint = FLEXIBLE_ENDPOINT()
-        .route("/omni/c6/reset")
+        .route("/omniC6Reset")
         .summary("Reset the C6 into application mode")
         .description("Pulses the C6 EN pin LOW for ~50 ms, then releases. The C6 reboots "
                      "into whatever image its OTA partition table currently points at. "
@@ -117,12 +117,12 @@ void OmniController::registerEndpoints(FlexibleEndpoints* endpoints) {
     endpoints->addEndpoint(c6ResetEndpoint);
 
     auto c6BootloaderEndpoint = FLEXIBLE_ENDPOINT()
-        .route("/omni/c6/bootloader")
+        .route("/omniC6Bootloader")
         .summary("Reset the C6 into ROM serial bootloader")
         .description("Holds the C6 BOOT pin LOW while pulsing EN, then releases BOOT. "
                      "The C6 enters its ROM serial bootloader and waits for the "
                      "esp-serial-flasher protocol on UART. Manual operation; the actual "
-                     "flash workflow lives behind /omni/c6/ota (lands in M-beta.2).")
+                     "flash workflow lives behind /omniC6Ota (lands in M-beta.2).")
         .params({})
         .responseType(JSON_RESPONSE)
         .responseDescription("JSON acknowledgement")

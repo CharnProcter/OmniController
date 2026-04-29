@@ -37,11 +37,16 @@ if (modules.omniController) {
 
 This library is being built in milestones. The current state corresponds to **M-α**: skeleton, module integration, and `/omni/status` endpoint only. SPI transport, UART flashing, discovery, and drivers land in later milestones (M-β through M-ι). See the project plan for the milestone table.
 
-Public endpoints in M-α:
+Public endpoints in M-α / M-β.1:
 
-| Route          | Method | Returns                                      |
-|----------------|--------|----------------------------------------------|
-| `/omni/status` | GET    | JSON with `fw`, `proto`, `began`, `drivers`. |
+| Route               | Method | Returns                                                    |
+|---------------------|--------|------------------------------------------------------------|
+| `/omniStatus`       | GET    | JSON with `fw`, `proto`, `began`, `milestone`, `drivers`.  |
+| `/omniC6Status`     | GET    | JSON with C6 link state and last GPIO action.              |
+| `/omniC6Reset`      | GET    | Pulse EN; reboot C6 into application.                      |
+| `/omniC6Bootloader` | GET    | Hold BOOT low + pulse EN; leave C6 in ROM serial bootloader.|
+
+Routes are flat camelCase per the AutomationPlatform convention. M-β.2 adds `/omniC6Ota` for the multipart firmware upload + UART flash flow.
 
 ## Companion project
 
