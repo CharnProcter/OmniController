@@ -5,6 +5,8 @@
 
 #include "FlexibleEndpoints.h"
 
+#include "../src/flasher/OmniUartFlasher.h"
+
 // Hardware contract for the C6 hat. Defaults match the AutomationPlatformPlus
 // board (ESP32-S3 with the OmniController hat); host projects on different
 // boards override by passing a custom OmniPins to begin(). Defaults exist so
@@ -32,9 +34,12 @@ public:
 
     bool began() const { return _began; }
 
+    omni::OmniUartFlasher& flasher() { return _flasher; }
+
 private:
     void registerEndpoints(FlexibleEndpoints* endpoints);
 
     bool _began = false;
     OmniPins _pins{};
+    omni::OmniUartFlasher _flasher;
 };

@@ -1,0 +1,62 @@
+#pragma once
+
+#include <Arduino.h>
+
+// OmniUartFlasher — drives the C6 daughterboard's EN/BOOT lines and (in M-β.2)
+// runs esp-serial-flasher to write firmware over UART.
+//
+// Pin contract:
+//   en   — output. Held HIGH (or INPUT_PULLUP) idle. Pulsed LOW to reset the C6.
+//   boot — dual-purpose. During UART flash sessions: output. Idle: caller can
+//          repurpose as INPUT_PULLUP for HANDSHAKE in M-γ. This class always
+//          leaves both pins in INPUT_PULLUP after each operation so post-flash
+//          HANDSHAKE is unaffected.
+//
+// All sequence timings come from the ESP32 ROM bootloader's documented
+// strap-pin requirements (≥10 ms BOOT-low before EN release; ≥50 ms EN-low for
+// reliable reset).
+
+namespace omni {
+
+enum class FlasherAction : uint8_t {
+    None       = 0,
+    Reset      = 1,
+    Bootloader = 2,
+    Flashing   = 3,  // reserved for M-β.2
+};
+
+const char* flasherActionName(FlasherAction a);
+
+class OmniUartFlasher {
+public:
+    void begin(uint8_t enPin, uint8_t bootPin);
+
+    // Pulse EN low to reset the C6 into normal application mode.
+    void resetTarget();
+
+    // Hold BOOT low while pulsing EN to enter the ROM serial bootloader.
+    // Caller is responsible for any subsequent flash protocol (M-β.2).
+    void enterBootloader();
+
+    // Status accessors for the /omni/c6/status endpoint.
+    FlasherAction lastAction() const { return _lastAction; }
+    uint32_t      lastActionMs() const { return _lastActionMs; }
+    bool          began() const { return _began; }
+    uint8_t       enPin() const { return _enPin; }
+    uint8_t       bootPin() const { return _bootPin; }
+
+private:
+    void driveEnLow();
+    void releaseEn();
+    void driveBootLow();
+    void releaseBoot();
+    void recordAction(FlasherAction a);
+
+    uint8_t _enPin   = 0;
+    uint8_t _bootPin = 0;
+    bool    _began   = false;
+    FlasherAction _lastAction = FlasherAction::None;
+    uint32_t      _lastActionMs = 0;
+};
+
+}  // namespace omni
