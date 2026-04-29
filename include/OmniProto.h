@@ -83,4 +83,82 @@ constexpr const char* kModeWifiOnly        = "wifi_only";
 constexpr const char* kModeBleOnly         = "ble_only";
 }  // namespace radio
 
+// Fixed transaction size for the SPI link. Both sides clock exactly this many
+// bytes per transaction. Frames smaller than this are zero-padded after the
+// CRC (the LEN field tells the receiver how many payload bytes are valid).
+// Sized to fit one full 1024-byte payload frame plus header + CRC plus a few
+// spare bytes.
+constexpr uint16_t kSpiTransactionBytes = 1040;
+
+// CRC16-CCITT-FALSE (poly 0x1021, init 0xFFFF, no reflection, no xorout).
+// Inline so both S3 and C6 builds can use it without linking.
+inline uint16_t crc16CcittFalse(const uint8_t* data, size_t len, uint16_t init = 0xFFFF) {
+    uint16_t crc = init;
+    while (len--) {
+        crc ^= (static_cast<uint16_t>(*data++) << 8);
+        for (uint8_t i = 0; i < 8; i++) {
+            crc = (crc & 0x8000) ? static_cast<uint16_t>((crc << 1) ^ 0x1021)
+                                 : static_cast<uint16_t>(crc << 1);
+        }
+    }
+    return crc;
+}
+
+// Encode a frame into a buffer of size kSpiTransactionBytes. Returns the
+// total frame length (header+payload+crc) on success, or 0 on failure
+// (payload too large, output too small, etc.). The buffer is padded with
+// 0xFF after the frame content so the SPI master/slave can clock fixed-size
+// transactions while still carrying variable-length frames.
+inline size_t encodeFrame(uint8_t* out, size_t outSize,
+                          Channel channel, uint8_t flags, uint16_t seq,
+                          const uint8_t* payload, uint16_t payloadLen) {
+    if (payloadLen > kMaxPayload) return 0;
+    if (outSize < kSpiTransactionBytes) return 0;
+    out[0] = kFrameMagic;
+    out[1] = static_cast<uint8_t>(channel);
+    out[2] = flags;
+    out[3] = static_cast<uint8_t>(payloadLen & 0xFF);
+    out[4] = static_cast<uint8_t>((payloadLen >> 8) & 0xFF);
+    out[5] = static_cast<uint8_t>(seq & 0xFF);
+    out[6] = static_cast<uint8_t>((seq >> 8) & 0xFF);
+    if (payloadLen && payload) {
+        for (uint16_t i = 0; i < payloadLen; i++) out[7 + i] = payload[i];
+    }
+    uint16_t crc = crc16CcittFalse(out + 1, 6 + payloadLen);  // CH..PAYLOAD
+    out[7 + payloadLen]     = static_cast<uint8_t>(crc & 0xFF);
+    out[7 + payloadLen + 1] = static_cast<uint8_t>((crc >> 8) & 0xFF);
+    size_t total = 9 + payloadLen;
+    for (size_t i = total; i < kSpiTransactionBytes; i++) out[i] = 0xFF;
+    return total;
+}
+
+struct DecodedFrame {
+    Channel  channel;
+    uint8_t  flags;
+    uint16_t seq;
+    uint16_t payloadLen;
+    const uint8_t* payload;  // points into the source buffer
+};
+
+// Decode a frame from a buffer. Returns true if the frame is valid (magic
+// matches, length sane, CRC verifies). On success, `out.payload` points into
+// `in` — caller must keep `in` valid while using `out.payload`.
+inline bool decodeFrame(const uint8_t* in, size_t inSize, DecodedFrame& out) {
+    if (inSize < 9) return false;
+    if (in[0] != kFrameMagic) return false;
+    uint16_t len = static_cast<uint16_t>(in[3]) | (static_cast<uint16_t>(in[4]) << 8);
+    if (len > kMaxPayload) return false;
+    if (inSize < static_cast<size_t>(9 + len)) return false;
+    uint16_t crcReceived = static_cast<uint16_t>(in[7 + len])
+                         | (static_cast<uint16_t>(in[7 + len + 1]) << 8);
+    uint16_t crcCalc = crc16CcittFalse(in + 1, 6 + len);
+    if (crcReceived != crcCalc) return false;
+    out.channel    = static_cast<Channel>(in[1]);
+    out.flags      = in[2];
+    out.seq        = static_cast<uint16_t>(in[5]) | (static_cast<uint16_t>(in[6]) << 8);
+    out.payloadLen = len;
+    out.payload    = (len > 0) ? (in + 7) : nullptr;
+    return true;
+}
+
 }  // namespace omni

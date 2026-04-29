@@ -6,6 +6,7 @@
 #include "FlexibleEndpoints.h"
 
 #include "../src/flasher/OmniUartFlasher.h"
+#include "../src/transport/OmniSpiMaster.h"
 
 // Hardware contract for the C6 hat. Defaults match the AutomationPlatformPlus
 // board (ESP32-S3 with the OmniController hat); host projects on different
@@ -34,7 +35,8 @@ public:
 
     bool began() const { return _began; }
 
-    omni::OmniUartFlasher& flasher() { return _flasher; }
+    omni::OmniUartFlasher& flasher()    { return _flasher; }
+    omni::OmniSpiMaster&   spiMaster()  { return _spiMaster; }
 
     // Handle one line of input from the host's USB-CDC Serial. Returns true
     // if the line was an OmniController serial-flash command (and was fully
@@ -51,4 +53,5 @@ private:
     bool _began = false;
     OmniPins _pins{};
     omni::OmniUartFlasher _flasher;
+    omni::OmniSpiMaster   _spiMaster;
 };

@@ -14,6 +14,7 @@ bool OmniController::begin(FlexibleEndpoints* endpoints, const OmniPins& pins) {
 
     _pins = pins;
     _flasher.begin(_pins.en, _pins.boot, _pins.uart_tx, _pins.uart_rx);
+    _spiMaster.begin(_pins.spi_cs, _pins.spi_mosi, _pins.spi_miso, _pins.spi_clk, _pins.boot);
 
     if (endpoints) {
         registerEndpoints(endpoints);
@@ -170,6 +171,93 @@ void OmniController::registerEndpoints(FlexibleEndpoints* endpoints) {
             return std::pair<String, int>(out, r.ok ? 200 : 502);
         });
     endpoints->addEndpoint(c6ProbeEndpoint);
+
+    auto c6EchoEndpoint = FLEXIBLE_ENDPOINT()
+        .route("/omniC6EchoTest")
+        .summary("Round-trip echo test over the C6 SPI link")
+        .description("M-gamma Push A acceptance test. Sends a fixed CTRL test "
+                     "frame to the C6 over SPI, then clocks a second transaction "
+                     "to read back the C6's echo (which arrives on the next "
+                     "transaction since SPI is full-duplex but the slave only "
+                     "knows what to echo after the first transaction completes). "
+                     "Returns the round-trip details as JSON; payload_text "
+                     "should read 'echo: <orig>' on success.")
+        .params({})
+        .responseType(JSON_RESPONSE)
+        .responseDescription("JSON with sent/received seq, payload, validity")
+        .handler([self](std::map<String, String>& /*params*/) -> std::pair<String, int> {
+            static uint16_t seq = 1;
+            static uint8_t txBuf[omni::kSpiTransactionBytes];
+            static uint8_t rxBuf[omni::kSpiTransactionBytes];
+
+            const char* msg = "echo-test";
+            const uint16_t msgLen = static_cast<uint16_t>(strlen(msg));
+
+            // Transaction 1: deliver our test frame, receive whatever the slave
+            // had pre-loaded (probably empty / no MAGIC on first call).
+            size_t encoded = omni::encodeFrame(
+                txBuf, sizeof(txBuf),
+                omni::Channel::Ctrl, omni::FlagAckReq, seq,
+                reinterpret_cast<const uint8_t*>(msg), msgLen);
+            if (encoded == 0) {
+                return std::pair<String, int>(
+                    String("{\"ok\":false,\"error\":\"encode_failed\"}"), 500);
+            }
+            if (!self->_spiMaster.transact(txBuf, rxBuf)) {
+                return std::pair<String, int>(
+                    String("{\"ok\":false,\"error\":\"transact_1_failed\"}"), 500);
+            }
+
+            // Transaction 2: send another ping (so the slave clocks data), receive
+            // the echo of transaction 1's payload from the slave's TX buffer.
+            uint16_t pingSeq = static_cast<uint16_t>(seq + 1);
+            encoded = omni::encodeFrame(
+                txBuf, sizeof(txBuf),
+                omni::Channel::Ctrl, 0, pingSeq,
+                reinterpret_cast<const uint8_t*>("ping"), 4);
+            if (encoded == 0) {
+                return std::pair<String, int>(
+                    String("{\"ok\":false,\"error\":\"encode_2_failed\"}"), 500);
+            }
+            if (!self->_spiMaster.transact(txBuf, rxBuf)) {
+                return std::pair<String, int>(
+                    String("{\"ok\":false,\"error\":\"transact_2_failed\"}"), 500);
+            }
+
+            JsonDocument doc;
+            doc["sent_seq"]   = seq;
+            doc["sent_payload"] = msg;
+
+            omni::DecodedFrame d{};
+            const bool ok = omni::decodeFrame(rxBuf, sizeof(rxBuf), d);
+            doc["frame_valid"] = ok;
+            if (ok) {
+                doc["echoed_channel"] = static_cast<uint8_t>(d.channel);
+                doc["echoed_seq"]     = d.seq;
+                doc["echoed_flags"]   = d.flags;
+                doc["payload_len"]    = d.payloadLen;
+                String payloadText;
+                payloadText.reserve(d.payloadLen);
+                for (uint16_t i = 0; i < d.payloadLen && i < 64; i++) {
+                    char c = static_cast<char>(d.payload[i]);
+                    payloadText += (c >= 0x20 && c < 0x7F) ? c : '.';
+                }
+                doc["payload_text"] = payloadText;
+                doc["echo_match"] = (d.payloadLen == msgLen + 6 /* "echo: " */
+                                     && memcmp(d.payload, "echo: ", 6) == 0
+                                     && memcmp(d.payload + 6, msg, msgLen) == 0);
+                doc["ok"] = true;
+            } else {
+                doc["ok"] = false;
+                doc["error"] = "decode_failed_or_no_frame";
+            }
+
+            seq = static_cast<uint16_t>(seq + 2);
+            String out;
+            serializeJson(doc, out);
+            return std::pair<String, int>(out, 200);
+        });
+    endpoints->addEndpoint(c6EchoEndpoint);
 }
 
 bool OmniController::handleSerialCommand(const String& line) {
