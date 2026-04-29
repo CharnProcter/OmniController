@@ -73,28 +73,47 @@ ProbeResult OmniUartFlasher::probeC6Target() {
 
     uint32_t t0 = millis();
 
+    Serial.printf("OmniUartFlasher: probing C6 (en=%u boot=%u tx=%u rx=%u uart=%d baud=%lu)\n",
+                  _enPin, _bootPin, _uartTxPin, _uartRxPin,
+                  (int)kFlasherUartPort, (unsigned long)kFlasherBaudRate);
+
+    // Workaround for Arduino-ESP32 v3 quirk: GPIO 43/44 are wired to UART0
+    // via IO_MUX by default, which fights any UART_NUM_1/2 driver that tries
+    // to claim them via GPIO matrix. Initialize UART0 once and end() so
+    // Arduino-ESP32 marks the IO_MUX route detachable. After that, esp-
+    // serial-flasher's port_esp32 can own the pins cleanly via UART_NUM_1.
+    // Pattern lifted from Libraries/UARTPassThrough/UARTPassThrough.cpp:34-37.
+    {
+        HardwareSerial uart0(0);
+        uart0.begin(115200);
+        uart0.end();
+        Serial.println("OmniUartFlasher: GPIO43/44 detached from UART0 IO_MUX");
+    }
+
     loader_esp32_config_t cfg{};
     cfg.baud_rate          = kFlasherBaudRate;
     cfg.uart_port          = kFlasherUartPort;
-    cfg.uart_rx_pin        = _uartRxPin;
-    cfg.uart_tx_pin        = _uartTxPin;
-    cfg.reset_trigger_pin  = _enPin;
-    cfg.gpio0_trigger_pin  = _bootPin;
+    cfg.uart_rx_pin        = (gpio_num_t)_uartRxPin;
+    cfg.uart_tx_pin        = (gpio_num_t)_uartTxPin;
+    cfg.reset_trigger_pin  = (gpio_num_t)_enPin;
+    cfg.gpio0_trigger_pin  = (gpio_num_t)_bootPin;
 
     esp_loader_error_t err = loader_port_esp32_init(&cfg);
     if (err != ESP_LOADER_SUCCESS) {
+        Serial.printf("OmniUartFlasher: port_esp32_init failed (%d)\n", (int)err);
         result.errorCode = (int32_t)err;
         result.chipName = "port_init failed";
         result.durationMs = millis() - t0;
-        loader_port_esp32_deinit();
         releaseStrapPins();
         recordAction(FlasherAction::Probe);
         return result;
     }
+    Serial.println("OmniUartFlasher: UART driver up, calling esp_loader_connect...");
 
     esp_loader_connect_args_t args = ESP_LOADER_CONNECT_DEFAULT();
     err = esp_loader_connect(&args);
     if (err != ESP_LOADER_SUCCESS) {
+        Serial.printf("OmniUartFlasher: esp_loader_connect failed (%d)\n", (int)err);
         result.errorCode = (int32_t)err;
         result.chipName = "connect failed";
         result.durationMs = millis() - t0;
@@ -105,6 +124,7 @@ ProbeResult OmniUartFlasher::probeC6Target() {
     }
 
     target_chip_t target = esp_loader_get_target();
+    Serial.printf("OmniUartFlasher: connected, target=%d\n", (int)target);
     result.ok        = true;
     result.errorCode = 0;
     result.chipName  = targetName(target);
