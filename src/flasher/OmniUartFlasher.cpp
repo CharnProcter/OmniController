@@ -188,17 +188,19 @@ bool OmniUartFlasher::flashBegin(uint32_t imageSize, uint32_t flashOffset) {
     }
     Serial.println("OmniUartFlasher: stub uploaded");
 
-    // After connect_with_stub the stub is loaded — use the stub-aware
-    // baud-change function (the ROM-mode variant returns UNSUPPORTED_FUNC
-    // post-stub).
-    err = esp_loader_change_transmission_rate_stub(kFlasherBaudRate, kFlasherFastBaud);
-    if (err != ESP_LOADER_SUCCESS) {
-        Serial.printf("OmniUartFlasher: change_transmission_rate_stub(%lu->%lu) failed (%d), staying at %lu\n",
-                      (unsigned long)kFlasherBaudRate, (unsigned long)kFlasherFastBaud,
-                      (int)err, (unsigned long)kFlasherBaudRate);
-    } else {
-        Serial.printf("OmniUartFlasher: bumped to %lu baud\n", (unsigned long)kFlasherFastBaud);
-    }
+    // We tested change_transmission_rate_stub(115200 -> 460800) and the call
+    // succeeded on the S3 side, but subsequent commands (flash_size detect,
+    // flash_start) consistently timed out at the new rate. Most likely the
+    // stub's CHANGE_BAUDRATE handler races with our follow-up commands or
+    // the bodge-wire signal integrity isn't clean enough at 460800. Either
+    // way the failure mode is "S3 thinks it bumped, C6 didn't" which leaves
+    // both sides at mismatched rates and bricks the rest of the session.
+    //
+    // Sticking with 115200 — ~37 s for a 411 KB image. Reliable beats fast.
+    // Revisit if/when we move from a bodge to a real PCB layout, or if
+    // esp-serial-flasher gets a more robust baud-change path.
+    Serial.printf("OmniUartFlasher: staying at %lu baud (stub baud-change is unreliable on this hat)\n",
+                  (unsigned long)kFlasherBaudRate);
 
     err = esp_loader_flash_start(flashOffset, imageSize, kFlasherBlockSize);
     if (err != ESP_LOADER_SUCCESS) {
