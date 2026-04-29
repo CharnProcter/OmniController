@@ -36,8 +36,17 @@ public:
 
     omni::OmniUartFlasher& flasher() { return _flasher; }
 
+    // Handle one line of input from the host's USB-CDC Serial. Returns true
+    // if the line was an OmniController serial-flash command (and was fully
+    // consumed, including any subsequent binary stream). Returns false if
+    // the line should fall through to the existing FlexibleEndpoints
+    // command dispatch. Blocks until the receive + flash sequence finishes
+    // when handling OMNI_C6_FLASH (~30 s for a typical image).
+    bool handleSerialCommand(const String& line);
+
 private:
     void registerEndpoints(FlexibleEndpoints* endpoints);
+    bool handleSerialFlashCommand(const String& line);
 
     bool _began = false;
     OmniPins _pins{};
