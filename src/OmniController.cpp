@@ -71,8 +71,9 @@ void OmniController::registerEndpoints(FlexibleEndpoints* endpoints) {
         .route("/omniC6Status")
         .summary("C6 daughterboard link status")
         .description("Returns current C6 link state: pin assignments, last manual action "
-                     "(reset / bootloader / flash) with timestamp. M-gamma adds SPI link "
-                     "health; M-delta adds OTA history.")
+                     "(reset / bootloader / flash) with timestamp, and last flash result "
+                     "(size, duration, error code). M-gamma adds SPI link health; "
+                     "M-delta adds OTA history.")
         .params({})
         .responseType(JSON_RESPONSE)
         .responseDescription("JSON link status")
@@ -90,6 +91,13 @@ void OmniController::registerEndpoints(FlexibleEndpoints* endpoints) {
             } else {
                 doc["last_action_ms_ago"] = (uint32_t)(millis() - ms);
             }
+            JsonObject flash = doc["flash"].to<JsonObject>();
+            flash["active"]      = self->_flasher.flashActive();
+            flash["last_ok"]     = self->_flasher.lastFlashOk();
+            flash["last_error"]  = self->_flasher.lastFlashError();
+            flash["last_size"]   = self->_flasher.lastFlashSize();
+            flash["last_offset"] = self->_flasher.lastFlashOffset();
+            flash["last_ms"]     = self->_flasher.lastFlashMs();
             String out;
             serializeJson(doc, out);
             return std::pair<String, int>(out, 200);

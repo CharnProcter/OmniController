@@ -52,6 +52,22 @@ public:
     // before wiring the full /omniC6Ota flash flow.
     ProbeResult probeC6Target();
 
+    // Streaming flash session. Multipart upload handlers call flashBegin()
+    // once on the first chunk, flashWrite() for every chunk, then flashFinish()
+    // on the last. flashAbort() cleans up if the upload fails mid-stream.
+    bool     flashBegin(uint32_t imageSize, uint32_t flashOffset);
+    bool     flashWrite(const uint8_t* data, uint32_t len);
+    bool     flashFinish(bool reboot);
+    void     flashAbort();
+
+    // Flash session state for /omniC6Status.
+    bool     flashActive()    const { return _flashActive; }
+    bool     lastFlashOk()    const { return _lastFlashOk; }
+    int32_t  lastFlashError() const { return _lastFlashError; }
+    uint32_t lastFlashSize()  const { return _lastFlashSize; }
+    uint32_t lastFlashOffset()const { return _lastFlashOffset; }
+    uint32_t lastFlashMs()    const { return _lastFlashMs; }
+
     // Status accessors.
     FlasherAction lastAction() const { return _lastAction; }
     uint32_t      lastActionMs() const { return _lastActionMs; }
@@ -68,6 +84,7 @@ private:
     void releaseBoot();
     void releaseStrapPins();
     void recordAction(FlasherAction a);
+    void detachUart0IoMux();
 
     uint8_t _enPin     = 0;
     uint8_t _bootPin   = 0;
@@ -76,6 +93,15 @@ private:
     bool    _began     = false;
     FlasherAction _lastAction = FlasherAction::None;
     uint32_t      _lastActionMs = 0;
+
+    // Flash session state.
+    bool     _flashActive     = false;
+    bool     _lastFlashOk     = false;
+    int32_t  _lastFlashError  = 0;
+    uint32_t _lastFlashSize   = 0;
+    uint32_t _lastFlashOffset = 0;
+    uint32_t _flashStartMs    = 0;
+    uint32_t _lastFlashMs     = 0;
 };
 
 }  // namespace omni

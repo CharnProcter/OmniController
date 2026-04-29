@@ -16,6 +16,8 @@ constexpr uint32_t kPostReleaseMs  = 20;   // settle time after releasing strap 
 
 constexpr uart_port_t kFlasherUartPort = UART_NUM_1;
 constexpr uint32_t   kFlasherBaudRate  = 115200;
+constexpr uint32_t   kFlasherFastBaud  = 460800;  // post-stub bump for throughput
+constexpr uint32_t   kFlasherBlockSize = 4096;    // stub block; ROM mode is limited to 1024
 
 const char* targetName(target_chip_t t) {
     switch (t) {
@@ -64,6 +66,16 @@ void OmniUartFlasher::releaseStrapPins() {
     pinMode(_bootPin, INPUT_PULLUP);
 }
 
+void OmniUartFlasher::detachUart0IoMux() {
+    // Workaround for Arduino-ESP32 v3 quirk: GPIO 43/44 are wired to UART0
+    // via IO_MUX by default, fighting any UART_NUM_1/2 driver that tries to
+    // claim them via GPIO matrix. Open UART0 once and end() so Arduino-ESP32
+    // marks the IO_MUX route detachable. See UARTPassThrough.cpp:34-37.
+    HardwareSerial uart0(0);
+    uart0.begin(115200);
+    uart0.end();
+}
+
 ProbeResult OmniUartFlasher::probeC6Target() {
     ProbeResult result{false, -1, "unknown", 0};
     if (!_began) {
@@ -77,18 +89,8 @@ ProbeResult OmniUartFlasher::probeC6Target() {
                   _enPin, _bootPin, _uartTxPin, _uartRxPin,
                   (int)kFlasherUartPort, (unsigned long)kFlasherBaudRate);
 
-    // Workaround for Arduino-ESP32 v3 quirk: GPIO 43/44 are wired to UART0
-    // via IO_MUX by default, which fights any UART_NUM_1/2 driver that tries
-    // to claim them via GPIO matrix. Initialize UART0 once and end() so
-    // Arduino-ESP32 marks the IO_MUX route detachable. After that, esp-
-    // serial-flasher's port_esp32 can own the pins cleanly via UART_NUM_1.
-    // Pattern lifted from Libraries/UARTPassThrough/UARTPassThrough.cpp:34-37.
-    {
-        HardwareSerial uart0(0);
-        uart0.begin(115200);
-        uart0.end();
-        Serial.println("OmniUartFlasher: GPIO43/44 detached from UART0 IO_MUX");
-    }
+    detachUart0IoMux();
+    Serial.println("OmniUartFlasher: GPIO43/44 detached from UART0 IO_MUX");
 
     loader_esp32_config_t cfg{};
     cfg.baud_rate          = kFlasherBaudRate;
@@ -134,6 +136,126 @@ ProbeResult OmniUartFlasher::probeC6Target() {
     releaseStrapPins();
     recordAction(FlasherAction::Probe);
     return result;
+}
+
+bool OmniUartFlasher::flashBegin(uint32_t imageSize, uint32_t flashOffset) {
+    if (!_began || _flashActive) {
+        _lastFlashError = -100;
+        _lastFlashOk = false;
+        return false;
+    }
+
+    Serial.printf("OmniUartFlasher: flashBegin size=%u offset=0x%X\n",
+                  (unsigned)imageSize, (unsigned)flashOffset);
+
+    _flashActive     = true;
+    _lastFlashOk     = false;
+    _lastFlashError  = 0;
+    _lastFlashSize   = imageSize;
+    _lastFlashOffset = flashOffset;
+    _flashStartMs    = millis();
+    _lastFlashMs     = 0;
+    recordAction(FlasherAction::Flashing);
+
+    detachUart0IoMux();
+
+    loader_esp32_config_t cfg{};
+    cfg.baud_rate          = kFlasherBaudRate;
+    cfg.uart_port          = kFlasherUartPort;
+    cfg.uart_rx_pin        = (gpio_num_t)_uartRxPin;
+    cfg.uart_tx_pin        = (gpio_num_t)_uartTxPin;
+    cfg.reset_trigger_pin  = (gpio_num_t)_enPin;
+    cfg.gpio0_trigger_pin  = (gpio_num_t)_bootPin;
+
+    esp_loader_error_t err = loader_port_esp32_init(&cfg);
+    if (err != ESP_LOADER_SUCCESS) {
+        Serial.printf("OmniUartFlasher: flashBegin port_init failed (%d)\n", (int)err);
+        _lastFlashError = (int32_t)err;
+        _flashActive = false;
+        releaseStrapPins();
+        return false;
+    }
+
+    esp_loader_connect_args_t args = ESP_LOADER_CONNECT_DEFAULT();
+    err = esp_loader_connect_with_stub(&args);
+    if (err != ESP_LOADER_SUCCESS) {
+        Serial.printf("OmniUartFlasher: flashBegin connect_with_stub failed (%d)\n", (int)err);
+        _lastFlashError = (int32_t)err;
+        _flashActive = false;
+        loader_port_esp32_deinit();
+        releaseStrapPins();
+        return false;
+    }
+    Serial.println("OmniUartFlasher: stub uploaded");
+
+    err = esp_loader_change_transmission_rate(kFlasherFastBaud);
+    if (err != ESP_LOADER_SUCCESS) {
+        Serial.printf("OmniUartFlasher: change_transmission_rate(%lu) failed (%d), staying at %lu\n",
+                      (unsigned long)kFlasherFastBaud, (int)err, (unsigned long)kFlasherBaudRate);
+        // Non-fatal — keep going at the original baud rate.
+    } else {
+        Serial.printf("OmniUartFlasher: bumped to %lu baud\n", (unsigned long)kFlasherFastBaud);
+    }
+
+    err = esp_loader_flash_start(flashOffset, imageSize, kFlasherBlockSize);
+    if (err != ESP_LOADER_SUCCESS) {
+        Serial.printf("OmniUartFlasher: flash_start failed (%d)\n", (int)err);
+        _lastFlashError = (int32_t)err;
+        _flashActive = false;
+        loader_port_esp32_deinit();
+        releaseStrapPins();
+        return false;
+    }
+
+    Serial.println("OmniUartFlasher: flash_start OK, ready to stream chunks");
+    return true;
+}
+
+bool OmniUartFlasher::flashWrite(const uint8_t* data, uint32_t len) {
+    if (!_flashActive) return false;
+
+    esp_loader_error_t err = esp_loader_flash_write((void*)data, len);
+    if (err != ESP_LOADER_SUCCESS) {
+        Serial.printf("OmniUartFlasher: flash_write(%u) failed (%d)\n", (unsigned)len, (int)err);
+        _lastFlashError = (int32_t)err;
+        return false;
+    }
+    return true;
+}
+
+bool OmniUartFlasher::flashFinish(bool reboot) {
+    if (!_flashActive) return false;
+
+    esp_loader_error_t err = esp_loader_flash_finish(reboot);
+    _lastFlashMs = millis() - _flashStartMs;
+    _flashActive = false;
+
+    loader_port_esp32_deinit();
+    releaseStrapPins();
+    recordAction(FlasherAction::None);
+
+    if (err != ESP_LOADER_SUCCESS) {
+        Serial.printf("OmniUartFlasher: flash_finish failed (%d) after %lu ms\n",
+                      (int)err, (unsigned long)_lastFlashMs);
+        _lastFlashError = (int32_t)err;
+        _lastFlashOk = false;
+        return false;
+    }
+
+    Serial.printf("OmniUartFlasher: flash done in %lu ms\n", (unsigned long)_lastFlashMs);
+    _lastFlashOk = true;
+    return true;
+}
+
+void OmniUartFlasher::flashAbort() {
+    if (!_flashActive) return;
+    Serial.println("OmniUartFlasher: flashAbort");
+    _lastFlashMs = millis() - _flashStartMs;
+    _lastFlashOk = false;
+    _flashActive = false;
+    loader_port_esp32_deinit();
+    releaseStrapPins();
+    recordAction(FlasherAction::None);
 }
 
 void OmniUartFlasher::resetTarget() {
