@@ -55,6 +55,48 @@ void OmniUartFlasher::begin(uint8_t enPin, uint8_t bootPin, uint8_t uartTxPin, u
     _uartRxPin = uartRxPin;
     releaseStrapPins();
     _began = true;
+    // Install the UART driver once, here, on whichever task called us
+    // (Arduino main on Core 1 in practice). Never deinit. Both probe and
+    // every flash session reuse this driver state. Cycling install/deinit
+    // between sessions hit a UART driver state-corruption bug where the
+    // tx_mutex came back NULL on subsequent inits — most visible when
+    // calls alternate between Core 0 (AsyncTCP) and Core 1 (Arduino).
+    initPersistentPort();
+}
+
+bool OmniUartFlasher::initPersistentPort() {
+    if (_portReady) return true;
+    detachUart0IoMux();
+
+    loader_esp32_config_t cfg{};
+    cfg.baud_rate         = kFlasherBaudRate;
+    cfg.uart_port         = kFlasherUartPort;
+    cfg.uart_rx_pin       = (gpio_num_t)_uartRxPin;
+    cfg.uart_tx_pin       = (gpio_num_t)_uartTxPin;
+    cfg.reset_trigger_pin = (gpio_num_t)_enPin;
+    cfg.gpio0_trigger_pin = (gpio_num_t)_bootPin;
+
+    esp_loader_error_t err = loader_port_esp32_init(&cfg);
+    if (err != ESP_LOADER_SUCCESS) {
+        Serial.printf("OmniUartFlasher: persistent port_init failed (%d)\n", (int)err);
+        return false;
+    }
+    _portReady = true;
+    Serial.println("OmniUartFlasher: UART driver installed (persistent)");
+    // port_esp32_init leaves both strap pins as OUTPUT HIGH. Hand them back
+    // to INPUT_PULLUP so the hat's external pull-ups + C6 internal pull-up
+    // dominate the line at idle, leaving HANDSHAKE-from-C6 unblocked.
+    releaseStrapPins();
+    return true;
+}
+
+void OmniUartFlasher::primeStrapPinsForFlash() {
+    // Before each flash session, hand the strap pins back to esp-serial-flasher.
+    // It expects them as OUTPUT and drives the levels itself during connect.
+    pinMode(_enPin, OUTPUT);
+    digitalWrite(_enPin, HIGH);
+    pinMode(_bootPin, OUTPUT);
+    digitalWrite(_bootPin, HIGH);
 }
 
 void OmniUartFlasher::releaseStrapPins() {
@@ -78,8 +120,8 @@ void OmniUartFlasher::detachUart0IoMux() {
 
 ProbeResult OmniUartFlasher::probeC6Target() {
     ProbeResult result{false, -1, "unknown", 0};
-    if (!_began) {
-        result.chipName = "flasher not begun";
+    if (!_began || !_portReady) {
+        result.chipName = "flasher not ready";
         return result;
     }
 
@@ -89,37 +131,16 @@ ProbeResult OmniUartFlasher::probeC6Target() {
                   _enPin, _bootPin, _uartTxPin, _uartRxPin,
                   (int)kFlasherUartPort, (unsigned long)kFlasherBaudRate);
 
-    detachUart0IoMux();
-    Serial.println("OmniUartFlasher: GPIO43/44 detached from UART0 IO_MUX");
-
-    loader_esp32_config_t cfg{};
-    cfg.baud_rate          = kFlasherBaudRate;
-    cfg.uart_port          = kFlasherUartPort;
-    cfg.uart_rx_pin        = (gpio_num_t)_uartRxPin;
-    cfg.uart_tx_pin        = (gpio_num_t)_uartTxPin;
-    cfg.reset_trigger_pin  = (gpio_num_t)_enPin;
-    cfg.gpio0_trigger_pin  = (gpio_num_t)_bootPin;
-
-    esp_loader_error_t err = loader_port_esp32_init(&cfg);
-    if (err != ESP_LOADER_SUCCESS) {
-        Serial.printf("OmniUartFlasher: port_esp32_init failed (%d)\n", (int)err);
-        result.errorCode = (int32_t)err;
-        result.chipName = "port_init failed";
-        result.durationMs = millis() - t0;
-        releaseStrapPins();
-        recordAction(FlasherAction::Probe);
-        return result;
-    }
-    Serial.println("OmniUartFlasher: UART driver up, calling esp_loader_connect...");
+    primeStrapPinsForFlash();
+    Serial.println("OmniUartFlasher: calling esp_loader_connect...");
 
     esp_loader_connect_args_t args = ESP_LOADER_CONNECT_DEFAULT();
-    err = esp_loader_connect(&args);
+    esp_loader_error_t err = esp_loader_connect(&args);
     if (err != ESP_LOADER_SUCCESS) {
         Serial.printf("OmniUartFlasher: esp_loader_connect failed (%d)\n", (int)err);
         result.errorCode = (int32_t)err;
         result.chipName = "connect failed";
         result.durationMs = millis() - t0;
-        loader_port_esp32_deinit();
         releaseStrapPins();
         recordAction(FlasherAction::Probe);
         return result;
@@ -132,14 +153,13 @@ ProbeResult OmniUartFlasher::probeC6Target() {
     result.chipName  = targetName(target);
     result.durationMs = millis() - t0;
 
-    loader_port_esp32_deinit();
     releaseStrapPins();
     recordAction(FlasherAction::Probe);
     return result;
 }
 
 bool OmniUartFlasher::flashBegin(uint32_t imageSize, uint32_t flashOffset) {
-    if (!_began || _flashActive) {
+    if (!_began || !_portReady || _flashActive) {
         _lastFlashError = -100;
         _lastFlashOk = false;
         return false;
@@ -157,32 +177,14 @@ bool OmniUartFlasher::flashBegin(uint32_t imageSize, uint32_t flashOffset) {
     _lastFlashMs     = 0;
     recordAction(FlasherAction::Flashing);
 
-    detachUart0IoMux();
-
-    loader_esp32_config_t cfg{};
-    cfg.baud_rate          = kFlasherBaudRate;
-    cfg.uart_port          = kFlasherUartPort;
-    cfg.uart_rx_pin        = (gpio_num_t)_uartRxPin;
-    cfg.uart_tx_pin        = (gpio_num_t)_uartTxPin;
-    cfg.reset_trigger_pin  = (gpio_num_t)_enPin;
-    cfg.gpio0_trigger_pin  = (gpio_num_t)_bootPin;
-
-    esp_loader_error_t err = loader_port_esp32_init(&cfg);
-    if (err != ESP_LOADER_SUCCESS) {
-        Serial.printf("OmniUartFlasher: flashBegin port_init failed (%d)\n", (int)err);
-        _lastFlashError = (int32_t)err;
-        _flashActive = false;
-        releaseStrapPins();
-        return false;
-    }
+    primeStrapPinsForFlash();
 
     esp_loader_connect_args_t args = ESP_LOADER_CONNECT_DEFAULT();
-    err = esp_loader_connect_with_stub(&args);
+    esp_loader_error_t err = esp_loader_connect_with_stub(&args);
     if (err != ESP_LOADER_SUCCESS) {
         Serial.printf("OmniUartFlasher: flashBegin connect_with_stub failed (%d)\n", (int)err);
         _lastFlashError = (int32_t)err;
         _flashActive = false;
-        loader_port_esp32_deinit();
         releaseStrapPins();
         return false;
     }
@@ -207,7 +209,6 @@ bool OmniUartFlasher::flashBegin(uint32_t imageSize, uint32_t flashOffset) {
         Serial.printf("OmniUartFlasher: flash_start failed (%d)\n", (int)err);
         _lastFlashError = (int32_t)err;
         _flashActive = false;
-        loader_port_esp32_deinit();
         releaseStrapPins();
         return false;
     }
@@ -235,7 +236,8 @@ bool OmniUartFlasher::flashFinish(bool reboot) {
     _lastFlashMs = millis() - _flashStartMs;
     _flashActive = false;
 
-    loader_port_esp32_deinit();
+    // Don't deinit the UART driver — it's persistent. Just hand the strap
+    // pins back to INPUT_PULLUP so HANDSHAKE-from-C6 (M-γ) isn't blocked.
     releaseStrapPins();
     recordAction(FlasherAction::None);
 
@@ -258,7 +260,6 @@ void OmniUartFlasher::flashAbort() {
     _lastFlashMs = millis() - _flashStartMs;
     _lastFlashOk = false;
     _flashActive = false;
-    loader_port_esp32_deinit();
     releaseStrapPins();
     recordAction(FlasherAction::None);
 }

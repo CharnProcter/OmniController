@@ -85,12 +85,15 @@ private:
     void releaseStrapPins();
     void recordAction(FlasherAction a);
     void detachUart0IoMux();
+    bool initPersistentPort();
+    void primeStrapPinsForFlash();
 
     uint8_t _enPin     = 0;
     uint8_t _bootPin   = 0;
     uint8_t _uartTxPin = 0;
     uint8_t _uartRxPin = 0;
-    bool    _began     = false;
+    bool    _began      = false;
+    bool    _portReady  = false;  // UART driver installed once and kept; see initPersistentPort
     FlasherAction _lastAction = FlasherAction::None;
     uint32_t      _lastActionMs = 0;
 
