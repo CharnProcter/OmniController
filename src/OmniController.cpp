@@ -226,7 +226,7 @@ bool OmniController::handleSerialFlashCommand(const String& line) {
         }
         uint32_t toRead = (uint32_t)avail;
         if (toRead > (size - received)) toRead = size - received;
-        size_t got = Serial.readBytes(buf + received, toRead);
+        size_t got = Serial.readBytes((char*)(buf + received), toRead);
         received += got;
         lastByteMs = millis();
     }
