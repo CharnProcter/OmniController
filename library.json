@@ -1,0 +1,25 @@
+{
+    "name": "OmniController",
+    "version": "0.1.0",
+    "description": "Local-first IoT omni-controller. Discovers and controls smart-home devices over WiFi/BLE/Zigbee/Thread/Matter via an ESP32-S3 + ESP32-C6 architecture.",
+    "keywords": "esp32, iot, zigbee, thread, matter, mdns, ssdp, ble, smarthome",
+    "repository": {
+        "type": "git",
+        "url": "https://github.com/CharnProcter/OmniController.git"
+    },
+    "authors": [
+        {
+            "name": "Charn Procter",
+            "maintainer": true
+        }
+    ],
+    "license": "MIT",
+    "frameworks": "arduino",
+    "platforms": "espressif32",
+    "dependencies": [
+        {
+            "name": "ArduinoJson",
+            "version": "^7"
+        }
+    ]
+}
