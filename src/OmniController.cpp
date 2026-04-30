@@ -2,6 +2,7 @@
 
 #include <ArduinoJson.h>
 #include <esp_rom_crc.h>
+#include "driver/uart.h"
 
 #include "OmniProto.h"
 
@@ -336,6 +337,100 @@ void OmniController::registerEndpoints(FlexibleEndpoints* endpoints) {
             return std::pair<String, int>(out, 200);
         });
     endpoints->addEndpoint(c6PollHandshakeEndpoint);
+
+    auto c6CaptureBootLogEndpoint = FLEXIBLE_ENDPOINT()
+        .route("/omniC6CaptureBootLog")
+        .summary("Reset C6 and capture its UART boot output")
+        .description("Pulses EN to reset the C6, then reads UART_NUM_1 (which is "
+                     "wired to the C6's UART0_TX = GPIO16 = default esp_log output) "
+                     "for `ms` milliseconds. Returns whatever the C6 printed during "
+                     "boot. Decodes ASCII bytes; non-printable bytes show as '?'. "
+                     "Use this when SPI itself is failing to find out whether the "
+                     "C6 is booting at all, in a boot loop, or stuck before our "
+                     "app's first log line. Don't run during an active flash "
+                     "session — UART_NUM_1 is shared with esp-serial-flasher.")
+        .params({
+            INT_PARAM("ms", "Capture window in ms (default 3000, max 10000)")
+        })
+        .responseType(JSON_RESPONSE)
+        .responseDescription("captured text + raw byte count + first-N hex")
+        .handler([self](std::map<String, String>& params) -> std::pair<String, int> {
+            if (self->_flasher.flashActive()) {
+                return std::pair<String, int>(
+                    String("{\"ok\":false,\"error\":\"flash_active\"}"), 409);
+            }
+            uint32_t ms = 3000;
+            if (params.find("ms") != params.end()) {
+                ms = (uint32_t)params["ms"].toInt();
+                if (ms < 100) ms = 100;
+                if (ms > 10000) ms = 10000;
+            }
+
+            // Flush whatever's been sitting in the RX buffer so we only see
+            // bytes that arrive AFTER the reset we're about to trigger.
+            uart_flush_input(UART_NUM_1);
+
+            // Reset the C6. flashes EN-low briefly. C6 reboots into its app
+            // (or whatever's currently in its boot partition) and starts
+            // printing log lines on its UART0_TX.
+            self->_flasher.resetTarget();
+            uint32_t startMs = millis();
+
+            // Read bytes for the capture window, accumulating into a buffer.
+            // Cap at 16 KB to keep the response payload sane.
+            constexpr size_t kCapMax = 16384;
+            static uint8_t accum[kCapMax];
+            size_t accumLen = 0;
+            uint8_t chunk[256];
+            while (millis() - startMs < ms && accumLen < kCapMax) {
+                int got = uart_read_bytes(
+                    UART_NUM_1, chunk, sizeof(chunk), pdMS_TO_TICKS(50));
+                if (got > 0) {
+                    size_t toCopy = (size_t)got;
+                    if (accumLen + toCopy > kCapMax) toCopy = kCapMax - accumLen;
+                    memcpy(accum + accumLen, chunk, toCopy);
+                    accumLen += toCopy;
+                }
+            }
+
+            JsonDocument doc;
+            doc["ok"]         = true;
+            doc["bytes"]      = (uint32_t)accumLen;
+            doc["window_ms"]  = ms;
+            doc["truncated"]  = (accumLen == kCapMax);
+
+            // Decode to printable text. CR stripped, LF kept, TAB kept,
+            // other non-printable replaced by '?'. Cap at 12 KB of text to
+            // keep JSON bounded.
+            String text;
+            text.reserve(accumLen);
+            for (size_t i = 0; i < accumLen && text.length() < 12288; i++) {
+                uint8_t b = accum[i];
+                if (b == '\r') continue;
+                if (b == '\n' || b == '\t') text += static_cast<char>(b);
+                else if (b >= 0x20 && b < 0x7F) text += static_cast<char>(b);
+                else text += '?';
+            }
+            doc["text"] = text;
+
+            // Also include a hex dump of the first 64 bytes so the user can
+            // sanity-check a boot ROM banner even if the baud is mid-transition.
+            String hex;
+            size_t hexLen = accumLen < 64 ? accumLen : 64;
+            hex.reserve(hexLen * 3);
+            for (size_t i = 0; i < hexLen; i++) {
+                char tmp[4];
+                snprintf(tmp, sizeof(tmp), "%02x ", accum[i]);
+                hex += tmp;
+            }
+            if (hex.length()) hex.remove(hex.length() - 1);
+            doc["first_64_hex"] = hex;
+
+            String out;
+            serializeJson(doc, out);
+            return std::pair<String, int>(out, 200);
+        });
+    endpoints->addEndpoint(c6CaptureBootLogEndpoint);
 }
 
 bool OmniController::handleSerialCommand(const String& line) {
