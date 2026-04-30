@@ -478,18 +478,21 @@ bool OmniController::handleSerialFlashCommand(const String& line) {
     Serial.println("OMNI_C6_READY");
     Serial.flush();
 
-    // Streaming pipeline: read a chunk from USB-CDC, accumulate CRC32, hand
-    // straight to flashWrite. No buffering of the whole image — works without
-    // PSRAM and keeps the stack budget tiny.
+    // Streaming pipeline: read from USB-CDC into a kBlockSize accumulator;
+    // call flashWrite once we have a full block (or the final tail).
     //
-    // Critical: esp-serial-flasher's esp_loader_flash_write requires size to
-    // be <= block_size set by flash_start. We cap toRead at OmniUartFlasher's
-    // kBlockSize so we never exceed it, regardless of how much Serial happens
-    // to have buffered. Earlier we used a 4096-byte chunk independent of the
-    // block size and got ESP_LOADER_ERROR_INVALID_PARAM (and MD5 mismatches
-    // when partial-block bookkeeping desynced).
-    constexpr uint32_t kChunkSize = omni::OmniUartFlasher::kBlockSize;
-    static uint8_t chunk[kChunkSize];
+    // CRITICAL: esp_loader_flash_write ALWAYS sends s_flash_write_size bytes
+    // per call regardless of the size argument — when you pass less, it pads
+    // with 0xFF up to s_flash_write_size and writes the full block to flash
+    // (see external/esp-serial-flasher/src/esp_loader.c flash_write). So
+    // every call except the very last MUST be exactly kBlockSize, otherwise
+    // we inject 0xFF padding into the middle of the flashed image and the
+    // C6's flash_verify MD5 fails. Earlier 4096-byte chunks failed with
+    // ESP_LOADER_ERROR_INVALID_PARAM; capping at kBlockSize made the param
+    // valid but introduced silent corruption whenever a chunk was short.
+    constexpr uint32_t kBlockSize = omni::OmniUartFlasher::kBlockSize;
+    static uint8_t block[kBlockSize];
+    uint32_t blockFill = 0;
     uint32_t runningCrc = 0;
     uint32_t received = 0;
     uint32_t lastByteMs = millis();
@@ -512,23 +515,37 @@ bool OmniController::handleSerialFlashCommand(const String& line) {
             continue;
         }
         uint32_t toRead = (uint32_t)avail;
-        if (toRead > kChunkSize) toRead = kChunkSize;
+        // Cap at remaining space in the current block (so we fill exactly).
+        uint32_t blockSpace = kBlockSize - blockFill;
+        if (toRead > blockSpace) toRead = blockSpace;
+        // Cap at remaining bytes in the whole image.
         if (toRead > (size - received)) toRead = size - received;
 
-        size_t got = Serial.readBytes((char*)chunk, toRead);
+        size_t got = Serial.readBytes((char*)(block + blockFill), toRead);
         if (got == 0) {
             yield();
             continue;
         }
-        runningCrc = esp_rom_crc32_le(runningCrc, chunk, got);
-        if (!_flasher.flashWrite(chunk, (uint32_t)got)) {
-            _flasher.flashAbort();
-            Serial.printf("OMNI_C6_FLASH_ERR write %d at_offset=%u\n",
-                          (int)_flasher.lastFlashError(), (unsigned)received);
-            return true;
-        }
-        received += got;
+        runningCrc = esp_rom_crc32_le(runningCrc, block + blockFill, got);
+        blockFill += (uint32_t)got;
+        received += (uint32_t)got;
         lastByteMs = millis();
+
+        // Flush a full block, OR flush whatever's left when we've hit `size`
+        // (final partial block). flashWrite for the partial tail is the only
+        // call that may legitimately pass < kBlockSize.
+        bool full     = (blockFill == kBlockSize);
+        bool finalTail = (received == size && blockFill > 0);
+        if (full || finalTail) {
+            if (!_flasher.flashWrite(block, blockFill)) {
+                _flasher.flashAbort();
+                Serial.printf("OMNI_C6_FLASH_ERR write %d at_offset=%u\n",
+                              (int)_flasher.lastFlashError(),
+                              (unsigned)(received - blockFill));
+                return true;
+            }
+            blockFill = 0;
+        }
 
         // Progress log every ~32 KB. Diagnostic only — PC client filters
         // anything that's not OMNI_C6_*. Helps us see where stalls happen.
