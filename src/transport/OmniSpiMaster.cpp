@@ -1,23 +1,37 @@
 #include "OmniSpiMaster.h"
-#include "OmniProto.h"
 
 #include "driver/spi_master.h"
 
 namespace omni {
 
 namespace {
-constexpr spi_host_device_t kHost = SPI3_HOST;
-constexpr int kClockHz = 20 * 1000 * 1000;  // 20 MHz; raise after stability proven
+constexpr spi_host_device_t kHost     = SPI3_HOST;
+constexpr int               kClockHz  = 20 * 1000 * 1000;  // 20 MHz; raise after stability proven
+constexpr uint32_t          kIdlePeriodMs = 1000;          // wake at least once per second
+constexpr uint8_t           kTxQueueDepth = 8;
+constexpr uint32_t          kTaskStackBytes = 4096;
+constexpr UBaseType_t       kTaskPriority   = 5;
+constexpr BaseType_t        kTaskCore       = 1;            // pin to core 1, away from WiFi/AsyncTCP
+
+// Each slot in the TX queue is one fully-encoded fixed-size transaction.
+struct TxSlot {
+    uint8_t bytes[kSpiTransactionBytes];
+};
+
+// Fallback idle frame — sent when the task wakes with nothing queued. Just a
+// CTRL ping with empty payload; the C6 will echo it back. Encoded once at
+// start() and reused.
+constexpr uint16_t kIdleSeqBase = 0x8000;  // distinguishable from real frame seqs
 }  // namespace
 
 bool OmniSpiMaster::begin(uint8_t cs, uint8_t mosi, uint8_t miso, uint8_t clk, uint8_t handshake) {
     if (_began) return true;
 
-    _cs = cs;
+    _cs   = cs;
     _mosi = mosi;
     _miso = miso;
-    _clk = clk;
-    _hs = handshake;
+    _clk  = clk;
+    _hs   = handshake;
 
     spi_bus_config_t bus{};
     bus.mosi_io_num     = mosi;
@@ -50,12 +64,12 @@ bool OmniSpiMaster::begin(uint8_t cs, uint8_t mosi, uint8_t miso, uint8_t clk, u
     }
     _device = handle;
 
-    // HANDSHAKE pin: input with pull-up. Bodge wire ties this through to the
-    // C6's GPIO9, which the C6 firmware drives low when it has data ready.
-    // Push-A doesn't actually wire the IRQ yet — caller initiates each
-    // transaction synchronously. IRQ wiring lands with the link bring-up
-    // in the next push.
+    // HANDSHAKE pin: input with pull-up. The C6 firmware drives it low when
+    // it has data ready. The IRQ is attached in start(); here we just put the
+    // pin in a sensible idle state.
     pinMode(_hs, INPUT_PULLUP);
+
+    _statsMutex = xSemaphoreCreateMutex();
 
     _began = true;
     Serial.printf(
@@ -64,7 +78,69 @@ bool OmniSpiMaster::begin(uint8_t cs, uint8_t mosi, uint8_t miso, uint8_t clk, u
     return true;
 }
 
+bool OmniSpiMaster::start() {
+    if (!_began) return false;
+    if (_taskRunning) return true;
+
+    if (_wakeSem == nullptr) _wakeSem = xSemaphoreCreateBinary();
+    if (_txQueue == nullptr) _txQueue = xQueueCreate(kTxQueueDepth, sizeof(TxSlot));
+    if (_wakeSem == nullptr || _txQueue == nullptr) {
+        Serial.println("OmniSpiMaster: failed to allocate task primitives");
+        return false;
+    }
+    // Drain any leftover frames from the previous run (e.g. queued just
+    // before a reflash) so the freshly-armed link doesn't immediately send
+    // stale traffic to the C6.
+    xQueueReset(_txQueue);
+
+    _taskShouldStop = false;
+    BaseType_t ok = xTaskCreatePinnedToCore(
+        &OmniSpiMaster::taskTrampoline,
+        "OmniSpi",
+        kTaskStackBytes,
+        this,
+        kTaskPriority,
+        &_taskHandle,
+        kTaskCore);
+    if (ok != pdPASS) {
+        Serial.println("OmniSpiMaster: task create failed");
+        return false;
+    }
+
+    // Attach the HANDSHAKE IRQ AFTER the task is up so any spurious early
+    // edge has somewhere to deliver its semaphore signal.
+    attachInterruptArg(_hs, &OmniSpiMaster::handshakeIsr, this, FALLING);
+
+    _taskRunning = true;
+    Serial.println("OmniSpiMaster: link task started, HANDSHAKE IRQ armed");
+    return true;
+}
+
+void OmniSpiMaster::stop() {
+    if (!_taskRunning) return;
+    detachInterrupt(_hs);
+    _taskShouldStop = true;
+    if (_wakeSem) xSemaphoreGive(_wakeSem);  // unblock the task so it can exit
+
+    // Wait briefly for the task to exit on its own. If it doesn't, force it.
+    for (int i = 0; i < 50 && _taskRunning; i++) vTaskDelay(pdMS_TO_TICKS(10));
+    if (_taskRunning && _taskHandle) {
+        vTaskDelete(_taskHandle);
+        _taskRunning = false;
+        _taskHandle  = nullptr;
+    }
+    Serial.println("OmniSpiMaster: link task stopped, HANDSHAKE IRQ released");
+}
+
 bool OmniSpiMaster::transact(const uint8_t* tx, uint8_t* rx) {
+    if (_taskRunning) {
+        Serial.println("OmniSpiMaster: transact() refused — link task owns the bus");
+        return false;
+    }
+    return clockTransaction(tx, rx);
+}
+
+bool OmniSpiMaster::clockTransaction(const uint8_t* tx, uint8_t* rx) {
     if (!_began || _device == nullptr) return false;
 
     spi_transaction_t t{};
@@ -79,6 +155,130 @@ bool OmniSpiMaster::transact(const uint8_t* tx, uint8_t* rx) {
         return false;
     }
     return true;
+}
+
+bool OmniSpiMaster::sendFrame(Channel channel, uint8_t flags, uint16_t seq,
+                              const uint8_t* payload, uint16_t payloadLen) {
+    if (!_taskRunning) return false;
+    if (payloadLen > kMaxPayload) return false;
+
+    TxSlot slot{};
+    size_t encoded = encodeFrame(slot.bytes, sizeof(slot.bytes),
+                                 channel, flags, seq, payload, payloadLen);
+    if (encoded == 0) return false;
+
+    // Non-blocking post — drop the frame if the queue is full rather than
+    // stalling the caller's task. Stats track the drop so it's visible.
+    if (xQueueSend(_txQueue, &slot, 0) != pdTRUE) {
+        if (_statsMutex && xSemaphoreTake(_statsMutex, portMAX_DELAY) == pdTRUE) {
+            _stats.tx_dropped++;
+            xSemaphoreGive(_statsMutex);
+        }
+        return false;
+    }
+    if (_wakeSem) xSemaphoreGive(_wakeSem);
+    return true;
+}
+
+OmniSpiMaster::LinkStats OmniSpiMaster::stats() const {
+    LinkStats out{};
+    if (_statsMutex && xSemaphoreTake(_statsMutex, portMAX_DELAY) == pdTRUE) {
+        out = _stats;
+        xSemaphoreGive(_statsMutex);
+    }
+    return out;
+}
+
+void OmniSpiMaster::taskTrampoline(void* arg) {
+    static_cast<OmniSpiMaster*>(arg)->taskLoop();
+    vTaskDelete(nullptr);
+}
+
+void OmniSpiMaster::taskLoop() {
+    // Pre-encode the idle/keepalive frame once. Sent whenever the task wakes
+    // with nothing pending in the TX queue — keeps the C6 talking back so
+    // the link liveness detection has data to chew on.
+    TxSlot idleFrame{};
+    uint16_t idleSeq = kIdleSeqBase;
+    encodeFrame(idleFrame.bytes, sizeof(idleFrame.bytes),
+                Channel::Ctrl, 0, idleSeq, nullptr, 0);
+
+    static TxSlot rx{};   // RX scratch (1040 B; static to keep stack small)
+    static TxSlot tx{};
+
+    while (!_taskShouldStop) {
+        // Wait for: HANDSHAKE IRQ, sendFrame post, or the 1 s idle timer.
+        xSemaphoreTake(_wakeSem, pdMS_TO_TICKS(kIdlePeriodMs));
+        if (_taskShouldStop) break;
+
+        // Pick the next outbound payload: queued frame, else idle keepalive.
+        bool fromQueue = (xQueueReceive(_txQueue, &tx, 0) == pdTRUE);
+        if (!fromQueue) {
+            // Refresh the idle seq each tick so we can tell consecutive
+            // idle frames apart in traces. No CRC update needed because we
+            // never check CRCs of frames we just authored locally.
+            idleSeq++;
+            idleFrame.bytes[5] = static_cast<uint8_t>(idleSeq & 0xFF);
+            idleFrame.bytes[6] = static_cast<uint8_t>((idleSeq >> 8) & 0xFF);
+            // Recompute CRC over the (single) seq-byte change — easier to
+            // just re-encode once per tick.
+            encodeFrame(idleFrame.bytes, sizeof(idleFrame.bytes),
+                        Channel::Ctrl, 0, idleSeq, nullptr, 0);
+            memcpy(tx.bytes, idleFrame.bytes, sizeof(tx.bytes));
+        }
+
+        if (!clockTransaction(tx.bytes, rx.bytes)) {
+            // Bus error — log once, brief sleep, retry on next wake.
+            vTaskDelay(pdMS_TO_TICKS(20));
+            continue;
+        }
+
+        const uint32_t now = millis();
+        if (_statsMutex && xSemaphoreTake(_statsMutex, 0) == pdTRUE) {
+            _stats.tx_frames++;
+            _stats.last_tx_ms = now;
+            xSemaphoreGive(_statsMutex);
+        }
+
+        // Decode RX. Anything that doesn't have MAGIC is silently ignored —
+        // the C6 may have clocked back 0xFF padding if it had no response
+        // queued. Frames with bad CRC are counted but not dispatched.
+        DecodedFrame f{};
+        if (rx.bytes[0] != kFrameMagic) {
+            if (_statsMutex && xSemaphoreTake(_statsMutex, 0) == pdTRUE) {
+                _stats.bad_magic++;
+                xSemaphoreGive(_statsMutex);
+            }
+            continue;
+        }
+        if (!decodeFrame(rx.bytes, kSpiTransactionBytes, f)) {
+            if (_statsMutex && xSemaphoreTake(_statsMutex, 0) == pdTRUE) {
+                _stats.bad_crc++;
+                xSemaphoreGive(_statsMutex);
+            }
+            continue;
+        }
+
+        if (_statsMutex && xSemaphoreTake(_statsMutex, 0) == pdTRUE) {
+            _stats.rx_frames++;
+            _stats.last_rx_ms = now;
+            xSemaphoreGive(_statsMutex);
+        }
+
+        if (_handler) _handler(f.channel, f.flags, f.seq, f.payload, f.payloadLen);
+    }
+
+    _taskRunning = false;
+    _taskHandle  = nullptr;
+}
+
+void IRAM_ATTR OmniSpiMaster::handshakeIsr(void* arg) {
+    auto* self = static_cast<OmniSpiMaster*>(arg);
+    if (self == nullptr || self->_wakeSem == nullptr) return;
+    BaseType_t hpw = pdFALSE;
+    self->_stats.handshake_irqs++;  // racy but cheap; just for diag
+    xSemaphoreGiveFromISR(self->_wakeSem, &hpw);
+    if (hpw == pdTRUE) portYIELD_FROM_ISR();
 }
 
 }  // namespace omni

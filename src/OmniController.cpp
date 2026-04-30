@@ -17,12 +17,18 @@ bool OmniController::begin(FlexibleEndpoints* endpoints, const OmniPins& pins) {
     _flasher.begin(_pins.en, _pins.boot, _pins.uart_tx, _pins.uart_rx);
     _spiMaster.begin(_pins.spi_cs, _pins.spi_mosi, _pins.spi_miso, _pins.spi_clk, _pins.boot);
 
+    // Push B: launch the async link task. It owns the SPI device after this
+    // point — the synchronous transact() path is locked out (still useful
+    // pre-start for the M-γ Push A echo test, hence the strict-once guard
+    // here rather than tying it into begin()).
+    _spiMaster.start();
+
     if (endpoints) {
         registerEndpoints(endpoints);
     }
 
     _began = true;
-    Serial.println("OmniController: initialized (M-beta.1)");
+    Serial.println("OmniController: initialized (M-gamma.B)");
     return true;
 }
 
@@ -37,6 +43,13 @@ std::vector<uint8_t> OmniController::getUsedPins() const {
         _pins.uart_tx,
         _pins.uart_rx,
     };
+}
+
+void OmniController::withSpiSuspended(std::function<void()> body) {
+    bool wasRunning = _spiMaster.taskRunning();
+    if (wasRunning) _spiMaster.stop();
+    body();
+    if (wasRunning) _spiMaster.start();
 }
 
 void OmniController::registerEndpoints(FlexibleEndpoints* endpoints) {
@@ -101,6 +114,25 @@ void OmniController::registerEndpoints(FlexibleEndpoints* endpoints) {
             flash["last_size"]   = self->_flasher.lastFlashSize();
             flash["last_offset"] = self->_flasher.lastFlashOffset();
             flash["last_ms"]     = self->_flasher.lastFlashMs();
+
+            // SPI link telemetry — Push B onward. last_rx_ms_ago is the
+            // primary "is the C6 talking?" indicator; a healthy link has
+            // it under 2 s during the idle keepalive cadence.
+            JsonObject link = doc["link"].to<JsonObject>();
+            auto s = self->_spiMaster.stats();
+            uint32_t now = millis();
+            link["task_running"]   = self->_spiMaster.taskRunning();
+            link["handshake_pin"]  = self->_pins.boot;
+            link["handshake_state"] = digitalRead(self->_pins.boot) ? "high" : "low";
+            link["tx_frames"]      = s.tx_frames;
+            link["rx_frames"]      = s.rx_frames;
+            link["bad_magic"]      = s.bad_magic;
+            link["bad_crc"]        = s.bad_crc;
+            link["tx_dropped"]     = s.tx_dropped;
+            link["handshake_irqs"] = s.handshake_irqs;
+            link["last_rx_ms_ago"] = (s.last_rx_ms == 0) ? (uint32_t)0 : (now - s.last_rx_ms);
+            link["last_tx_ms_ago"] = (s.last_tx_ms == 0) ? (uint32_t)0 : (now - s.last_tx_ms);
+
             String out;
             serializeJson(doc, out);
             return std::pair<String, int>(out, 200);
@@ -117,7 +149,7 @@ void OmniController::registerEndpoints(FlexibleEndpoints* endpoints) {
         .responseType(JSON_RESPONSE)
         .responseDescription("JSON acknowledgement")
         .handler([self](std::map<String, String>& /*params*/) -> std::pair<String, int> {
-            self->_flasher.resetTarget();
+            self->withSpiSuspended([self]() { self->_flasher.resetTarget(); });
             JsonDocument doc;
             doc["ok"] = true;
             doc["action"] = omni::flasherActionName(self->_flasher.lastAction());
@@ -138,10 +170,17 @@ void OmniController::registerEndpoints(FlexibleEndpoints* endpoints) {
         .responseType(JSON_RESPONSE)
         .responseDescription("JSON acknowledgement")
         .handler([self](std::map<String, String>& /*params*/) -> std::pair<String, int> {
+            // Don't restart the link task here — the C6 is now in ROM
+            // bootloader, won't speak our protocol until the user resets it
+            // (which goes through withSpiSuspended again, restarting then).
+            bool wasRunning = self->_spiMaster.taskRunning();
+            if (wasRunning) self->_spiMaster.stop();
             self->_flasher.enterBootloader();
             JsonDocument doc;
             doc["ok"] = true;
             doc["action"] = omni::flasherActionName(self->_flasher.lastAction());
+            doc["link_task_was_running"] = wasRunning;
+            doc["link_task_running"] = false;
             String out;
             serializeJson(doc, out);
             return std::pair<String, int>(out, 200);
@@ -161,135 +200,30 @@ void OmniController::registerEndpoints(FlexibleEndpoints* endpoints) {
         .responseType(JSON_RESPONSE)
         .responseDescription("JSON probe result with chip name and timing")
         .handler([self](std::map<String, String>& /*params*/) -> std::pair<String, int> {
+            // Probe leaves the C6 in bootloader state — same as the bootloader
+            // endpoint, the link task can't restart yet. /omniC6Reset is the
+            // way back to normal operation.
+            bool wasRunning = self->_spiMaster.taskRunning();
+            if (wasRunning) self->_spiMaster.stop();
             auto r = self->_flasher.probeC6Target();
             JsonDocument doc;
             doc["ok"] = r.ok;
             doc["error_code"] = r.errorCode;
             doc["chip"] = r.chipName;
             doc["duration_ms"] = r.durationMs;
+            doc["link_task_was_running"] = wasRunning;
+            doc["link_task_running"] = false;
             String out;
             serializeJson(doc, out);
             return std::pair<String, int>(out, r.ok ? 200 : 502);
         });
     endpoints->addEndpoint(c6ProbeEndpoint);
 
-    auto c6EchoEndpoint = FLEXIBLE_ENDPOINT()
-        .route("/omniC6EchoTest")
-        .summary("Round-trip echo test over the C6 SPI link")
-        .description("M-gamma Push A acceptance test. Sends a fixed CTRL test "
-                     "frame to the C6 over SPI, then clocks a second transaction "
-                     "to read back the C6's echo (which arrives on the next "
-                     "transaction since SPI is full-duplex but the slave only "
-                     "knows what to echo after the first transaction completes). "
-                     "Returns the round-trip details as JSON; payload_text "
-                     "should read 'echo: <orig>' on success. Diagnostic fields "
-                     "rx1_hex / rx2_hex show the first 32 bytes received on each "
-                     "transaction — useful when frame_valid is false.")
-        .params({})
-        .responseType(JSON_RESPONSE)
-        .responseDescription("JSON with sent/received seq, payload, validity")
-        .handler([self](std::map<String, String>& /*params*/) -> std::pair<String, int> {
-            static uint16_t seq = 1;
-            static uint8_t txBuf[omni::kSpiTransactionBytes];
-            static uint8_t rx1Buf[omni::kSpiTransactionBytes];
-            static uint8_t rx2Buf[omni::kSpiTransactionBytes];
-
-            auto hexDump = [](const uint8_t* buf, size_t n) {
-                String s;
-                s.reserve(n * 3);
-                for (size_t i = 0; i < n; i++) {
-                    char hex[4];
-                    snprintf(hex, sizeof(hex), "%02x ", buf[i]);
-                    s += hex;
-                }
-                if (s.length()) s.remove(s.length() - 1);  // trim trailing space
-                return s;
-            };
-
-            const char* msg = "echo-test";
-            const uint16_t msgLen = static_cast<uint16_t>(strlen(msg));
-
-            // Transaction 1: deliver our test frame, receive whatever the slave
-            // had pre-loaded (probably empty / no MAGIC on first call).
-            size_t encoded = omni::encodeFrame(
-                txBuf, sizeof(txBuf),
-                omni::Channel::Ctrl, omni::FlagAckReq, seq,
-                reinterpret_cast<const uint8_t*>(msg), msgLen);
-            if (encoded == 0) {
-                return std::pair<String, int>(
-                    String("{\"ok\":false,\"error\":\"encode_failed\"}"), 500);
-            }
-            if (!self->_spiMaster.transact(txBuf, rx1Buf)) {
-                return std::pair<String, int>(
-                    String("{\"ok\":false,\"error\":\"transact_1_failed\"}"), 500);
-            }
-
-            // Small delay to give the C6 time to decode T1 and queue the echo
-            // for T2. SpiSlaveTask runs in its own task so this is generous.
-            delay(20);
-
-            // Transaction 2: send another ping (so the slave clocks data), receive
-            // the echo of transaction 1's payload from the slave's TX buffer.
-            uint16_t pingSeq = static_cast<uint16_t>(seq + 1);
-            encoded = omni::encodeFrame(
-                txBuf, sizeof(txBuf),
-                omni::Channel::Ctrl, 0, pingSeq,
-                reinterpret_cast<const uint8_t*>("ping"), 4);
-            if (encoded == 0) {
-                return std::pair<String, int>(
-                    String("{\"ok\":false,\"error\":\"encode_2_failed\"}"), 500);
-            }
-            if (!self->_spiMaster.transact(txBuf, rx2Buf)) {
-                return std::pair<String, int>(
-                    String("{\"ok\":false,\"error\":\"transact_2_failed\"}"), 500);
-            }
-
-            JsonDocument doc;
-            doc["sent_seq"]     = seq;
-            doc["sent_payload"] = msg;
-            doc["rx1_hex"]      = hexDump(rx1Buf, 32);
-            doc["rx2_hex"]      = hexDump(rx2Buf, 32);
-
-            // Quick "is anything alive on MISO" check
-            bool rx2_all_ones = true, rx2_all_zeros = true;
-            for (size_t i = 0; i < 32; i++) {
-                if (rx2Buf[i] != 0xFF) rx2_all_ones = false;
-                if (rx2Buf[i] != 0x00) rx2_all_zeros = false;
-            }
-            if (rx2_all_ones)  doc["miso_state"] = "all_0xFF (slave silent or MISO floating high)";
-            else if (rx2_all_zeros) doc["miso_state"] = "all_0x00 (slave silent or MISO pulled low)";
-            else doc["miso_state"] = "varied (slave is sending bytes)";
-
-            omni::DecodedFrame d{};
-            const bool ok = omni::decodeFrame(rx2Buf, sizeof(rx2Buf), d);
-            doc["frame_valid"] = ok;
-            if (ok) {
-                doc["echoed_channel"] = static_cast<uint8_t>(d.channel);
-                doc["echoed_seq"]     = d.seq;
-                doc["echoed_flags"]   = d.flags;
-                doc["payload_len"]    = d.payloadLen;
-                String payloadText;
-                payloadText.reserve(d.payloadLen);
-                for (uint16_t i = 0; i < d.payloadLen && i < 64; i++) {
-                    char c = static_cast<char>(d.payload[i]);
-                    payloadText += (c >= 0x20 && c < 0x7F) ? c : '.';
-                }
-                doc["payload_text"] = payloadText;
-                doc["echo_match"] = (d.payloadLen == msgLen + 6 /* "echo: " */
-                                     && memcmp(d.payload, "echo: ", 6) == 0
-                                     && memcmp(d.payload + 6, msg, msgLen) == 0);
-                doc["ok"] = true;
-            } else {
-                doc["ok"] = false;
-                doc["error"] = "decode_failed_or_no_frame";
-            }
-
-            seq = static_cast<uint16_t>(seq + 2);
-            String out;
-            serializeJson(doc, out);
-            return std::pair<String, int>(out, 200);
-        });
-    endpoints->addEndpoint(c6EchoEndpoint);
+    // /omniC6EchoTest was the M-γ Push A acceptance test (synchronous round-
+    // trip via two direct transact() calls). Push B replaces it with the
+    // continuous link task — /omniC6Status now shows tx_frames and rx_frames
+    // climbing as the idle keepalive bounces back from the C6, which is a
+    // stronger ongoing signal than a one-shot test.
 
     auto c6PollHandshakeEndpoint = FLEXIBLE_ENDPOINT()
         .route("/omniC6PollHandshake")
@@ -459,11 +393,20 @@ bool OmniController::handleSerialFlashCommand(const String& line) {
         return true;
     }
 
+    // Pause the SPI link task for the duration of the flash. flashBegin
+    // takes BOOT (= GPIO12 = HANDSHAKE) as an output, which would fight the
+    // master task's IRQ wiring. Restart deferred until flashFinish so the
+    // freshly-flashed C6 has a moment to come up before the master starts
+    // clocking transactions at it.
+    bool linkWasRunning = _spiMaster.taskRunning();
+    if (linkWasRunning) _spiMaster.stop();
+
     // Open the flash session before signalling READY — that way the C6 enters
     // bootloader mode and the stub uploads while the PC is still preparing
     // its stream. flashBegin can take a couple of seconds; do it first.
     if (!_flasher.flashBegin(size, 0x0)) {
         Serial.printf("OMNI_C6_FLASH_ERR begin %d\n", (int)_flasher.lastFlashError());
+        if (linkWasRunning) _spiMaster.start();
         return true;
     }
 
@@ -507,6 +450,7 @@ bool OmniController::handleSerialFlashCommand(const String& line) {
             _flasher.flashAbort();
             Serial.printf("OMNI_C6_FLASH_ERR rx_timeout %u_of_%u\n",
                           (unsigned)received, (unsigned)size);
+            if (linkWasRunning) _spiMaster.start();
             return true;
         }
         int avail = Serial.available();
@@ -542,6 +486,7 @@ bool OmniController::handleSerialFlashCommand(const String& line) {
                 Serial.printf("OMNI_C6_FLASH_ERR write %d at_offset=%u\n",
                               (int)_flasher.lastFlashError(),
                               (unsigned)(received - blockFill));
+                if (linkWasRunning) _spiMaster.start();
                 return true;
             }
             blockFill = 0;
@@ -561,6 +506,7 @@ bool OmniController::handleSerialFlashCommand(const String& line) {
         _flasher.flashAbort();
         Serial.printf("OMNI_C6_CRC_FAIL expected=%08x actual=%08x size=%u\n",
                       (unsigned)expectedCrc, (unsigned)runningCrc, (unsigned)size);
+        if (linkWasRunning) _spiMaster.start();
         return true;
     }
     Serial.printf("OMNI_C6_RX_OK %u bytes crc=%08x\n",
@@ -569,10 +515,20 @@ bool OmniController::handleSerialFlashCommand(const String& line) {
 
     if (!_flasher.flashFinish(true /*reboot*/)) {
         Serial.printf("OMNI_C6_FLASH_ERR finish %d\n", (int)_flasher.lastFlashError());
+        if (linkWasRunning) _spiMaster.start();
         return true;
     }
 
     Serial.printf("OMNI_C6_FLASH_OK size=%u flash_ms=%u\n",
                   (unsigned)size, (unsigned)_flasher.lastFlashMs());
+
+    // Give the freshly-flashed C6 a moment to come up before re-arming the
+    // link IRQ — the C6's startup sequence drives GPIO9 and we don't want
+    // spurious edges to flood the wake semaphore before the firmware has
+    // settled.
+    if (linkWasRunning) {
+        delay(200);
+        _spiMaster.start();
+    }
     return true;
 }

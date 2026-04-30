@@ -1,6 +1,7 @@
 #pragma once
 
 #include <Arduino.h>
+#include <functional>
 #include <vector>
 
 #include "FlexibleEndpoints.h"
@@ -49,6 +50,13 @@ public:
 private:
     void registerEndpoints(FlexibleEndpoints* endpoints);
     bool handleSerialFlashCommand(const String& line);
+
+    // Run `body` with the SPI link task suspended — stops the task, runs body
+    // (which is free to drive GPIO12 / reset / bootloader / flash), then
+    // restarts the task. Used by all flasher endpoints because the UART
+    // flasher repurposes BOOT (= GPIO12 = HANDSHAKE) as an output, which
+    // would otherwise fight the master task's IRQ wiring.
+    void withSpiSuspended(std::function<void()> body);
 
     bool _began = false;
     OmniPins _pins{};
