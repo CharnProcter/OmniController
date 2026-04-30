@@ -3,6 +3,7 @@
 #include <ArduinoJson.h>
 #include <esp_rom_crc.h>
 #include "driver/uart.h"
+#include "esp_heap_caps.h"
 
 #include "OmniProto.h"
 
@@ -676,10 +677,13 @@ void OmniController::ctrlPumpLoop() {
 
 namespace {
 // Stream buffer between producer (HTTP upload callback or USB-CDC reader)
-// and the worker task. 32 KB is enough to absorb a few seconds of UART
-// drain backlog without back-pressuring the producer; sized so AsyncTCP's
-// upload chunks (typically ≤8 KB) fit even when the worker is mid-block.
-constexpr size_t kFlashStreamCapacity = 32 * 1024;
+// and the worker task. Sized to hold an entire C6 image (typical merged
+// bundle is ~440 KB) so the producer never back-pressures — earlier 32 KB
+// buffer + 1 s timeout returned partial writes during the first 2 s of
+// flashBegin (worker blocked, buffer filled at network speed, timeout
+// fired before the worker started draining). 1 MB in PSRAM is cheap on
+// the S3 (8 MB available) and removes the failure mode entirely.
+constexpr size_t kFlashStreamCapacity = 1 * 1024 * 1024;
 constexpr size_t kFlashStreamTrigger  = 1;  // wake worker on any byte
 constexpr uint32_t kFlashWorkerStackBytes = 8192;
 constexpr UBaseType_t kFlashWorkerPriority = 5;
@@ -702,9 +706,27 @@ bool OmniController::startFlashStream(uint32_t imageSize, uint32_t flashOffset,
     }
 
     // Lazy-init the stream buffer + completion semaphore. They persist
-    // across sessions (cheaper than recreating them every time).
+    // across sessions (cheaper than recreating them every time). The
+    // storage byte array goes in PSRAM — at 1 MB it's too large for
+    // internal RAM, and xStreamBufferCreate's default allocator only
+    // pulls from internal heap. xStreamBufferCreateStatic lets us hand
+    // it a PSRAM-allocated storage block.
     if (_flashStream == nullptr) {
-        _flashStream = xStreamBufferCreate(kFlashStreamCapacity, kFlashStreamTrigger);
+        static StaticStreamBuffer_t sStreamMgmt;
+        uint8_t* storage = static_cast<uint8_t*>(
+            heap_caps_malloc(kFlashStreamCapacity, MALLOC_CAP_SPIRAM));
+        if (storage == nullptr) {
+            // Fall back to internal RAM with a smaller buffer if PSRAM is
+            // somehow unavailable. 64 KB still beats the previous 32 KB
+            // and avoids the back-pressure failure for typical uploads.
+            Serial.println("OmniController: PSRAM alloc failed, falling back to 64 KB internal");
+            _flashStream = xStreamBufferCreate(64 * 1024, kFlashStreamTrigger);
+        } else {
+            _flashStream = xStreamBufferCreateStatic(
+                kFlashStreamCapacity, kFlashStreamTrigger, storage, &sStreamMgmt);
+            Serial.printf("OmniController: flash stream %u KB in PSRAM @ %p\n",
+                          (unsigned)(kFlashStreamCapacity / 1024), storage);
+        }
     }
     if (_flashWorkerDone == nullptr) {
         _flashWorkerDone = xSemaphoreCreateBinary();
