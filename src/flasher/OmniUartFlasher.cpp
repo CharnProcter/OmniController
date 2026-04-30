@@ -232,6 +232,24 @@ bool OmniUartFlasher::flashWrite(const uint8_t* data, uint32_t len) {
 bool OmniUartFlasher::flashFinish(bool reboot) {
     if (!_flashActive) return false;
 
+    // Verify before finishing. esp-serial-flasher accumulated an MD5 of every
+    // byte we wrote during flashWrite; this asks the C6 stub to compute the
+    // same hash on what's actually in flash and compare. Catches bytes
+    // corrupted in transit on the UART (single-bit errors etc.) — which
+    // would otherwise leave the C6 in a boot loop with a corrupt image.
+    esp_loader_error_t verr = esp_loader_flash_verify();
+    if (verr != ESP_LOADER_SUCCESS) {
+        Serial.printf("OmniUartFlasher: flash_verify failed (%d) — image corrupted in transit\n",
+                      (int)verr);
+        _lastFlashMs = millis() - _flashStartMs;
+        _lastFlashError = (int32_t)verr;
+        _lastFlashOk = false;
+        _flashActive = false;
+        releaseStrapPins();
+        recordAction(FlasherAction::None);
+        return false;
+    }
+
     esp_loader_error_t err = esp_loader_flash_finish(reboot);
     _lastFlashMs = millis() - _flashStartMs;
     _flashActive = false;
@@ -249,7 +267,8 @@ bool OmniUartFlasher::flashFinish(bool reboot) {
         return false;
     }
 
-    Serial.printf("OmniUartFlasher: flash done in %lu ms\n", (unsigned long)_lastFlashMs);
+    Serial.printf("OmniUartFlasher: flash done + verified in %lu ms\n",
+                  (unsigned long)_lastFlashMs);
     _lastFlashOk = true;
     return true;
 }
