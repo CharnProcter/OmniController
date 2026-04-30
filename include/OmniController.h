@@ -1,12 +1,12 @@
 #pragma once
 
 #include <Arduino.h>
+#include <FS.h>
 #include <functional>
 #include <vector>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
-#include "freertos/stream_buffer.h"
 #include "freertos/task.h"
 
 #include "FlexibleEndpoints.h"
@@ -37,6 +37,15 @@ struct OmniPins {
 class OmniController {
 public:
     bool begin(FlexibleEndpoints* endpoints, const OmniPins& pins);
+
+    // Hand the controller a filesystem to use for OTA staging and (in
+    // future milestones) device DB / driver state persistence. Caller
+    // retains ownership — typically the AutomationPlatform's already-
+    // mounted SPIFFS instance. Optional: if no FS is provided, the
+    // streaming flash path is disabled and HTTP /omniC6Ota will reject
+    // requests. Call before begin(); switching FS at runtime isn't
+    // supported.
+    void setFs(fs::FS* fs) { _fs = fs; }
 
     std::vector<uint8_t> getUsedPins() const;
 
@@ -124,15 +133,16 @@ private:
     TaskHandle_t      _ctrlPumpTask = nullptr;
     uint16_t          _ctrlTxSeq    = 1;
 
-    // Flash-stream session state (M-β.3 OTA refactor). The worker task
-    // owns the active flash session; producers feed bytes through the
-    // stream buffer. All volatile fields are read/written from both the
-    // producer and worker tasks.
+    // Flash-stream session state (M-β.3 OTA refactor). Producers stream
+    // bytes into a SPIFFS staging file; once the upload is complete the
+    // worker task reads the file and pushes it through esp-serial-flasher
+    // to the C6. Decouples the slow C6 UART work from the upload path.
     static void flashWorkerTrampoline(void* arg);
     void flashWorkerLoop();
     void finishFlashWorker(bool ok, int32_t errorCode, const char* msg);
 
-    StreamBufferHandle_t _flashStream     = nullptr;
+    fs::FS*              _fs              = nullptr;
+    File                 _stagingFile;
     TaskHandle_t         _flashWorkerTask = nullptr;
     SemaphoreHandle_t    _flashWorkerDone = nullptr;
     volatile bool        _flashStreamActive   = false;

@@ -3,7 +3,6 @@
 #include <ArduinoJson.h>
 #include <esp_rom_crc.h>
 #include "driver/uart.h"
-#include "esp_heap_caps.h"
 
 #include "OmniProto.h"
 
@@ -12,15 +11,13 @@
 #endif
 
 namespace {
-// Stream buffer between producer (HTTP upload callback or USB-CDC reader)
-// and the worker task. Kept deliberately small — when full, feedFlashStream
-// retries on partial writes which naturally back-pressures TCP through
-// AsyncTCP. 16 KB absorbs ~10 chunks of 1.4 KB HTTP payload before the
-// producer starts blocking, and at the C6's UART drain rate (~12 KB/s)
-// the buffer empties in ~1.3 s — comfortable per-call latencies on
-// AsyncTCP, no extended stalls.
-constexpr size_t      kFlashStreamCapacity   = 16 * 1024;
-constexpr size_t      kFlashStreamTrigger    = 1;  // wake worker on any byte
+// SPIFFS staging path. The HTTP upload callback (or USB-CDC reader)
+// writes the inbound C6 image here as it arrives — same as the S3's
+// own /updateOTA pattern, just to a flat file instead of an OTA
+// partition. After the upload completes the worker task reads it back
+// and feeds it to the C6 over UART. AsyncTCP only blocks per chunk for
+// the SPIFFS write (~15-30 ms), well under any heap-pressure threshold.
+constexpr const char* kFlashStagePath        = "/omni_c6_stage.bin";
 constexpr uint32_t    kFlashWorkerStackBytes = 8192;
 constexpr UBaseType_t kFlashWorkerPriority   = 5;
 constexpr BaseType_t  kFlashWorkerCore       = 1;  // away from AsyncTCP on Core 0
@@ -51,34 +48,16 @@ bool OmniController::begin(FlexibleEndpoints* endpoints, const OmniPins& pins) {
     xTaskCreatePinnedToCore(&OmniController::ctrlPumpTrampoline,
                             "OmniCtrlPump", 4096, this, 4, &_ctrlPumpTask, 1);
 
-    // M-β.3: pre-allocate the flash-stream storage now, while heap is
-    // fresh and contiguous. Lazy-allocating at upload time was failing
-    // because by then the heap is fragmented (WiFi state, AsyncWebServer
-    // connection pool, WS clients) and contiguous blocks even at 64 KB
-    // can be unobtainable. Try PSRAM first via heap_caps_malloc — if that
-    // fails (PSRAM not configured for malloc), fall back to internal RAM.
-    {
-        static StaticStreamBuffer_t sFlashStreamMgmt;
-        uint8_t* storage = static_cast<uint8_t*>(
-            heap_caps_malloc(kFlashStreamCapacity, MALLOC_CAP_SPIRAM));
-        const char* loc = "PSRAM";
-        if (storage == nullptr) {
-            storage = static_cast<uint8_t*>(
-                heap_caps_malloc(kFlashStreamCapacity, MALLOC_CAP_8BIT));
-            loc = "internal";
-        }
-        if (storage == nullptr) {
-            Serial.printf("OmniController: flash stream %u KB alloc failed (heap=%u largest=%u)\n",
-                          (unsigned)(kFlashStreamCapacity / 1024),
-                          (unsigned)heap_caps_get_free_size(MALLOC_CAP_8BIT),
-                          (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
-        } else {
-            _flashStream = xStreamBufferCreateStatic(
-                kFlashStreamCapacity, kFlashStreamTrigger, storage, &sFlashStreamMgmt);
-            Serial.printf("OmniController: flash stream %u KB in %s @ %p\n",
-                          (unsigned)(kFlashStreamCapacity / 1024), loc, storage);
-        }
-        _flashWorkerDone = xSemaphoreCreateBinary();
+    // M-β.3: flash-stream worker uses SPIFFS staging via setFs(). The
+    // completion semaphore is created here; the actual staging file is
+    // opened/closed per session in startFlashStream / worker.
+    _flashWorkerDone = xSemaphoreCreateBinary();
+    if (_fs == nullptr) {
+        Serial.println("OmniController: no FS attached — /omniC6Ota disabled (call setFs() before begin)");
+    } else if (_fs->exists(kFlashStagePath)) {
+        // Clean up any stale staging file from a previous boot (e.g. a
+        // session that was interrupted by a reset).
+        _fs->remove(kFlashStagePath);
     }
 
     if (endpoints) {
@@ -734,96 +713,110 @@ bool OmniController::startFlashStream(uint32_t imageSize, uint32_t flashOffset,
         Serial.println("OmniController: flasher not begun");
         return false;
     }
-
-    // Stream buffer + completion semaphore are allocated once in begin()
-    // when the heap is fresh — see the note in begin() for why.
-    if (_flashStream == nullptr || _flashWorkerDone == nullptr) {
-        Serial.println("OmniController: flash stream not initialised (begin() must run first)");
+    if (_fs == nullptr) {
+        Serial.println("OmniController: no FS attached for OTA staging");
+        return false;
+    }
+    if (_flashWorkerDone == nullptr) {
+        Serial.println("OmniController: flash worker primitives not initialised (begin() must run first)");
         return false;
     }
 
-    // Drain leftovers from any previous session and clear the completion
-    // signal so the new worker starts from a known state.
-    xStreamBufferReset(_flashStream);
+    // Open the staging file fresh — truncate any partial leftovers from
+    // an aborted previous session.
+    if (_fs->exists(kFlashStagePath)) _fs->remove(kFlashStagePath);
+    _stagingFile = _fs->open(kFlashStagePath, FILE_WRITE);
+    if (!_stagingFile) {
+        Serial.printf("OmniController: failed to open staging file %s\n", kFlashStagePath);
+        return false;
+    }
+
+    // Clear stale completion signal so a new wait starts from known state.
     xSemaphoreTake(_flashWorkerDone, 0);
 
-    // Pause the SPI master — flashBegin (called inside the worker)
-    // repurposes BOOT/HANDSHAKE as an output, which would fight the
-    // master's IRQ wiring. Worker restarts the master on its way out.
-    _flashStreamLinkWasRunning = _spiMaster.taskRunning();
-    if (_flashStreamLinkWasRunning) _spiMaster.stop();
-
-    _flashStreamSize         = imageSize;
-    _flashStreamOffset       = flashOffset;
-    _flashStreamExpectedCrc  = expectedCrc;
-    _flashStreamAborted      = false;
-    _flashStreamOk           = false;
-    _flashStreamErrorCode    = 0;
-    _flashStreamErrorMsg     = nullptr;
+    _flashStreamSize           = imageSize;
+    _flashStreamOffset         = flashOffset;
+    _flashStreamExpectedCrc    = expectedCrc;
+    _flashStreamAborted        = false;
+    _flashStreamOk             = false;
+    _flashStreamErrorCode      = 0;
+    _flashStreamErrorMsg       = nullptr;
     _flashStreamBytesProcessed = 0;
-    _flashStreamDurationMs   = 0;
-    _flashStreamRunningCrc   = 0;
-    _flashStreamStartMs      = millis();
-    _flashStreamActive       = true;
+    _flashStreamDurationMs     = 0;
+    _flashStreamRunningCrc     = 0;
+    _flashStreamStartMs        = millis();
+    _flashStreamActive         = true;
+    _flashStreamLinkWasRunning = false;  // we don't pause the SPI master
+                                          // until the worker actually starts
+                                          // flashing — keep the link alive
+                                          // during the upload phase
 
-    BaseType_t ok = xTaskCreatePinnedToCore(
-        &OmniController::flashWorkerTrampoline,
-        "OmniFlash",
-        kFlashWorkerStackBytes,
-        this,
-        kFlashWorkerPriority,
-        &_flashWorkerTask,
-        kFlashWorkerCore);
-    if (ok != pdPASS) {
-        Serial.println("OmniController: flash worker task create failed");
-        _flashStreamActive = false;
-        if (_flashStreamLinkWasRunning) _spiMaster.start();
-        return false;
-    }
-
-    Serial.printf("OmniController: flash stream started size=%u offset=0x%X\n",
-                  (unsigned)imageSize, (unsigned)flashOffset);
+    Serial.printf("OmniController: flash stream started size=%u offset=0x%X (staging %s)\n",
+                  (unsigned)imageSize, (unsigned)flashOffset, kFlashStagePath);
     return true;
 }
 
 size_t OmniController::feedFlashStream(const uint8_t* data, size_t len,
-                                       uint32_t timeoutMs) {
-    if (!_flashStreamActive || _flashStream == nullptr) return 0;
+                                       uint32_t /*timeoutMs*/) {
+    if (!_flashStreamActive || !_stagingFile) return 0;
     if (data == nullptr || len == 0) return 0;
+    if (_flashStreamAborted) return 0;
 
-    // xStreamBufferSend with a non-zero timeout returns partial writes if
-    // the timeout expires before all bytes fit (e.g. the worker is stuck
-    // in flashBegin's ~2 s connect-with-stub and isn't draining yet, while
-    // the producer is feeding at network speed). Loop until either all
-    // bytes are pushed or `timeoutMs` total has elapsed with no progress.
-    //
-    // While this can briefly block AsyncTCP when the buffer fills, that's
-    // exactly what gives us natural TCP back-pressure: the upload sender
-    // throttles to match the C6's UART drain rate, no big buffer required.
-    size_t pushed = 0;
-    uint32_t deadline = millis() + timeoutMs;
-    while (pushed < len) {
-        uint32_t now = millis();
-        if (now >= deadline) break;
-        TickType_t remainingTicks = pdMS_TO_TICKS(deadline - now);
-        size_t got = xStreamBufferSend(_flashStream, data + pushed,
-                                       len - pushed, remainingTicks);
-        if (got == 0) {
-            // No progress within the remaining timeout — give up.
-            break;
-        }
-        pushed += got;
+    // Append to the staging file. SPIFFS writes at ~50-100 KB/s with
+    // ~15-30 ms per ~1.4 KB chunk — short enough that the upload callback
+    // is not effectively blocking AsyncTCP for any meaningful duration.
+    size_t written = _stagingFile.write(data, len);
+    if (written != len) {
+        Serial.printf("OmniController: staging write short (got=%u of %u)\n",
+                      (unsigned)written, (unsigned)len);
+        // Probably out of SPIFFS space — abort the session.
+        _flashStreamAborted = true;
+        return written;
     }
-    return pushed;
+    _flashStreamRunningCrc = esp_rom_crc32_le(_flashStreamRunningCrc, data, len);
+    _flashStreamBytesProcessed += len;
+
+    // When the upload hits the expected size, close the file, kick off
+    // the worker, and let the producer return — completion is asynchronous.
+    if (_flashStreamBytesProcessed >= _flashStreamSize) {
+        _stagingFile.flush();
+        _stagingFile.close();
+
+        // Pause the SPI master before the worker drives BOOT/HANDSHAKE.
+        _flashStreamLinkWasRunning = _spiMaster.taskRunning();
+        if (_flashStreamLinkWasRunning) _spiMaster.stop();
+
+        BaseType_t ok = xTaskCreatePinnedToCore(
+            &OmniController::flashWorkerTrampoline,
+            "OmniFlash",
+            kFlashWorkerStackBytes,
+            this,
+            kFlashWorkerPriority,
+            &_flashWorkerTask,
+            kFlashWorkerCore);
+        if (ok != pdPASS) {
+            Serial.println("OmniController: flash worker task create failed");
+            finishFlashWorker(false, -1, "task_create_failed");
+        }
+    }
+    return len;
 }
 
 void OmniController::abortFlashStream() {
     if (!_flashStreamActive) return;
     _flashStreamAborted = true;
-    // Wake the worker if it's blocked in xStreamBufferReceive — sending
-    // any byte will return early, then the worker sees _flashStreamAborted
-    // on its next iteration and bails.
-    if (_flashStream) xStreamBufferReset(_flashStream);
+    if (_stagingFile) {
+        _stagingFile.close();
+    }
+    if (_fs && _fs->exists(kFlashStagePath)) {
+        _fs->remove(kFlashStagePath);
+    }
+    // If a worker is running it'll see _flashStreamAborted on its next
+    // iteration; if not, the upload was aborted before the worker spawned
+    // — finish the session right here.
+    if (_flashWorkerTask == nullptr) {
+        finishFlashWorker(false, -2, "aborted");
+    }
 }
 
 void OmniController::flashWorkerTrampoline(void* arg) {
@@ -832,73 +825,71 @@ void OmniController::flashWorkerTrampoline(void* arg) {
 }
 
 void OmniController::flashWorkerLoop() {
+    // Producer-supplied CRC check before we touch the C6 — if the
+    // upload was corrupted in transit (HTTP path: the CRC is 0 and
+    // skipped; USB-CDC path: CRC32 over the bytes the script computed),
+    // catch it here without burning a bootloader cycle.
+    if (_flashStreamExpectedCrc != 0 &&
+        _flashStreamRunningCrc != _flashStreamExpectedCrc) {
+        finishFlashWorker(false, -3, "crc_mismatch");
+        return;
+    }
+
+    if (_fs == nullptr) {
+        finishFlashWorker(false, -4, "no_fs");
+        return;
+    }
+    File staged = _fs->open(kFlashStagePath, FILE_READ);
+    if (!staged) {
+        finishFlashWorker(false, -5, "staging_open_failed");
+        return;
+    }
+
     // The worker owns the flash session for its lifetime. Open the C6
     // bootloader connection here (in the worker task's context, NOT on
     // AsyncTCP) so esp-serial-flasher's blocking UART work happens away
     // from any latency-sensitive callers.
     if (!_flasher.flashBegin(_flashStreamSize, _flashStreamOffset)) {
+        staged.close();
         finishFlashWorker(false, _flasher.lastFlashError(), "flashBegin failed");
         return;
     }
 
     constexpr uint32_t kBlockSize = omni::OmniUartFlasher::kBlockSize;
     static uint8_t block[kBlockSize];
-    uint32_t blockFill  = 0;
-    uint32_t totalRead  = 0;
-    uint32_t crc        = 0;
+    uint32_t totalRead = 0;
 
     while (totalRead < _flashStreamSize) {
         if (_flashStreamAborted) {
             _flasher.flashAbort();
+            staged.close();
             finishFlashWorker(false, -2, "aborted");
             return;
         }
 
-        uint32_t toRead = kBlockSize - blockFill;
-        if (toRead > _flashStreamSize - totalRead) {
-            toRead = _flashStreamSize - totalRead;
-        }
+        uint32_t toRead = _flashStreamSize - totalRead;
+        if (toRead > kBlockSize) toRead = kBlockSize;
 
-        // 30 s inter-byte timeout. If the producer goes silent (HTTP
-        // connection drop, USB-CDC stall) the worker bails rather than
-        // hanging the C6 in stub mode forever.
-        size_t got = xStreamBufferReceive(_flashStream,
-                                          block + blockFill,
-                                          toRead,
-                                          pdMS_TO_TICKS(30000));
-        if (got == 0) {
+        int got = staged.read(block, toRead);
+        if (got <= 0) {
+            // Premature EOF — staging file truncated unexpectedly.
             _flasher.flashAbort();
-            finishFlashWorker(false, -1, "rx_timeout");
+            staged.close();
+            finishFlashWorker(false, -6, "staging_read_short");
             return;
         }
 
-        crc = esp_rom_crc32_le(crc, block + blockFill, got);
-        blockFill += (uint32_t)got;
-        totalRead += (uint32_t)got;
-
-        bool full      = (blockFill == kBlockSize);
-        bool finalTail = (totalRead == _flashStreamSize && blockFill > 0);
-        if (full || finalTail) {
-            if (!_flasher.flashWrite(block, blockFill)) {
-                _flasher.flashAbort();
-                finishFlashWorker(false, _flasher.lastFlashError(),
-                                  "flashWrite failed");
-                return;
-            }
-            blockFill = 0;
+        if (!_flasher.flashWrite(block, (uint32_t)got)) {
+            _flasher.flashAbort();
+            staged.close();
+            finishFlashWorker(false, _flasher.lastFlashError(), "flashWrite failed");
+            return;
         }
 
-        _flashStreamBytesProcessed = totalRead;
-        _flashStreamRunningCrc     = crc;
+        totalRead += (uint32_t)got;
     }
 
-    // Producer-supplied CRC check (USB-CDC path supplies a CRC; HTTP path
-    // can pass 0 to skip — multipart uploads are TCP-checksummed already).
-    if (_flashStreamExpectedCrc != 0 && crc != _flashStreamExpectedCrc) {
-        _flasher.flashAbort();
-        finishFlashWorker(false, -3, "crc_mismatch");
-        return;
-    }
+    staged.close();
 
     // flashFinish handles MD5 verify + EN-pulse reset of the C6.
     if (!_flasher.flashFinish(true /*reboot*/)) {
@@ -916,6 +907,13 @@ void OmniController::finishFlashWorker(bool ok, int32_t errorCode, const char* m
     _flashStreamDurationMs = millis() - _flashStreamStartMs;
     Serial.printf("OmniController: flash worker exit ok=%d err=%d msg=%s ms=%u\n",
                   ok ? 1 : 0, (int)errorCode, msg ? msg : "", (unsigned)_flashStreamDurationMs);
+
+    // Make sure the staging file is closed (idempotent) and removed —
+    // it's served its purpose, no reason to leave 400+ KB on SPIFFS.
+    if (_stagingFile) _stagingFile.close();
+    if (_fs && _fs->exists(kFlashStagePath)) {
+        _fs->remove(kFlashStagePath);
+    }
 
     // Restart the link master if it was running before the session opened.
     // The flashFinish above already did the EN pulse, so the C6 is rebooting
