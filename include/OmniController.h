@@ -84,6 +84,9 @@ public:
     int32_t flashStreamLastError() const { return _flashStreamErrorCode; }
     const char* flashStreamLastErrorMsg() const { return _flashStreamErrorMsg ? _flashStreamErrorMsg : ""; }
     uint32_t flashStreamBytesProcessed() const { return _flashStreamBytesProcessed; }
+    uint32_t flashStreamBytesFlashed()   const { return _flashStreamBytesFlashed; }
+    uint32_t flashStreamSize()           const { return _flashStreamSize; }
+    const char* flashStreamPhase()       const { return _flashStreamPhase; }
     uint32_t flashStreamDurationMs() const { return _flashStreamDurationMs; }
     uint32_t flashStreamRunningCrc() const { return _flashStreamRunningCrc; }
 
@@ -156,6 +159,8 @@ private:
     int32_t              _flashStreamErrorCode = 0;
     const char*          _flashStreamErrorMsg  = nullptr;
     uint32_t             _flashStreamBytesProcessed = 0;
+    uint32_t             _flashStreamBytesFlashed   = 0;
     uint32_t             _flashStreamDurationMs = 0;
     uint32_t             _flashStreamRunningCrc = 0;
+    const char*          _flashStreamPhase = "idle";
 };

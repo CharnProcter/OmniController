@@ -158,10 +158,13 @@ void OmniController::registerEndpoints(FlexibleEndpoints* endpoints) {
             // session_active goes false to learn the outcome.
             JsonObject session = doc["session"].to<JsonObject>();
             session["active"]            = self->flashStreamActive();
+            session["phase"]             = self->flashStreamPhase();
             session["last_ok"]           = self->flashStreamLastOk();
             session["last_error"]        = self->flashStreamLastError();
             session["last_error_msg"]    = self->flashStreamLastErrorMsg();
-            session["bytes_processed"]   = self->flashStreamBytesProcessed();
+            session["size"]              = self->flashStreamSize();
+            session["bytes_processed"]   = self->flashStreamBytesProcessed();  // upload progress
+            session["bytes_flashed"]     = self->flashStreamBytesFlashed();    // flash progress
             session["duration_ms"]       = self->flashStreamDurationMs();
             session["running_crc"]       = self->flashStreamRunningCrc();
 
@@ -742,8 +745,10 @@ bool OmniController::startFlashStream(uint32_t imageSize, uint32_t flashOffset,
     _flashStreamErrorCode      = 0;
     _flashStreamErrorMsg       = nullptr;
     _flashStreamBytesProcessed = 0;
+    _flashStreamBytesFlashed   = 0;
     _flashStreamDurationMs     = 0;
     _flashStreamRunningCrc     = 0;
+    _flashStreamPhase          = "uploading";
     _flashStreamStartMs        = millis();
     _flashStreamActive         = true;
     _flashStreamLinkWasRunning = false;  // we don't pause the SPI master
@@ -845,6 +850,8 @@ void OmniController::flashWorkerLoop() {
         return;
     }
 
+    _flashStreamPhase = "connecting";
+
     // The worker owns the flash session for its lifetime. Open the C6
     // bootloader connection here (in the worker task's context, NOT on
     // AsyncTCP) so esp-serial-flasher's blocking UART work happens away
@@ -855,9 +862,12 @@ void OmniController::flashWorkerLoop() {
         return;
     }
 
+    _flashStreamPhase = "flashing";
+
     constexpr uint32_t kBlockSize = omni::OmniUartFlasher::kBlockSize;
     static uint8_t block[kBlockSize];
     uint32_t totalRead = 0;
+    uint32_t lastProgressLog = 0;
 
     while (totalRead < _flashStreamSize) {
         if (_flashStreamAborted) {
@@ -887,9 +897,23 @@ void OmniController::flashWorkerLoop() {
         }
 
         totalRead += (uint32_t)got;
+        _flashStreamBytesFlashed = totalRead;
+
+        // Progress log every ~64 KB so the serial console (and anything
+        // tailing it) shows the flash is making forward progress. The
+        // worker takes ~36 s for a 436 KB image — without logs this looks
+        // like a hang. /omniC6Status pollers see the same data via
+        // session.bytes_flashed.
+        if (totalRead - lastProgressLog >= 64 * 1024 || totalRead == _flashStreamSize) {
+            Serial.printf("OmniController: flash %u/%u (%u%%)\n",
+                          (unsigned)totalRead, (unsigned)_flashStreamSize,
+                          (unsigned)((uint64_t)totalRead * 100 / _flashStreamSize));
+            lastProgressLog = totalRead;
+        }
     }
 
     staged.close();
+    _flashStreamPhase = "verifying";
 
     // flashFinish handles MD5 verify + EN-pulse reset of the C6.
     if (!_flasher.flashFinish(true /*reboot*/)) {
@@ -904,6 +928,7 @@ void OmniController::finishFlashWorker(bool ok, int32_t errorCode, const char* m
     _flashStreamOk         = ok;
     _flashStreamErrorCode  = errorCode;
     _flashStreamErrorMsg   = msg;
+    _flashStreamPhase      = ok ? "done" : "error";
     _flashStreamDurationMs = millis() - _flashStreamStartMs;
     Serial.printf("OmniController: flash worker exit ok=%d err=%d msg=%s ms=%u\n",
                   ok ? 1 : 0, (int)errorCode, msg ? msg : "", (unsigned)_flashStreamDurationMs);
