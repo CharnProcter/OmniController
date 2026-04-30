@@ -127,6 +127,19 @@ void OmniController::registerEndpoints(FlexibleEndpoints* endpoints) {
             flash["last_offset"] = self->_flasher.lastFlashOffset();
             flash["last_ms"]     = self->_flasher.lastFlashMs();
 
+            // Streaming flash session state (M-β.3). The HTTP /omniC6Ota
+            // path is asynchronous — it returns 202 Accepted as soon as
+            // the upload finishes, and clients poll these fields until
+            // session_active goes false to learn the outcome.
+            JsonObject session = doc["session"].to<JsonObject>();
+            session["active"]            = self->flashStreamActive();
+            session["last_ok"]           = self->flashStreamLastOk();
+            session["last_error"]        = self->flashStreamLastError();
+            session["last_error_msg"]    = self->flashStreamLastErrorMsg();
+            session["bytes_processed"]   = self->flashStreamBytesProcessed();
+            session["duration_ms"]       = self->flashStreamDurationMs();
+            session["running_crc"]       = self->flashStreamRunningCrc();
+
             // SPI link telemetry — Push B onward. last_rx_ms_ago is the
             // primary "is the C6 talking?" indicator; a healthy link has
             // it under 2 s during the idle keepalive cadence.
@@ -414,29 +427,8 @@ bool OmniController::handleSerialFlashCommand(const String& line) {
     crcStr.trim();
     uint32_t expectedCrc = (uint32_t)strtoul(crcStr.c_str(), nullptr, 16);
 
-    if (size == 0 || size > 8 * 1024 * 1024) {
-        Serial.printf("OMNI_C6_FLASH_ERR bad_size %u\n", (unsigned)size);
-        return true;
-    }
     if (!_flasher.began()) {
         Serial.println("OMNI_C6_FLASH_ERR flasher_not_begun");
-        return true;
-    }
-
-    // Pause the SPI link task for the duration of the flash. flashBegin
-    // takes BOOT (= GPIO12 = HANDSHAKE) as an output, which would fight the
-    // master task's IRQ wiring. Restart deferred until flashFinish so the
-    // freshly-flashed C6 has a moment to come up before the master starts
-    // clocking transactions at it.
-    bool linkWasRunning = _spiMaster.taskRunning();
-    if (linkWasRunning) _spiMaster.stop();
-
-    // Open the flash session before signalling READY — that way the C6 enters
-    // bootloader mode and the stub uploads while the PC is still preparing
-    // its stream. flashBegin can take a couple of seconds; do it first.
-    if (!_flasher.flashBegin(size, 0x0)) {
-        Serial.printf("OMNI_C6_FLASH_ERR begin %d\n", (int)_flasher.lastFlashError());
-        if (linkWasRunning) _spiMaster.start();
         return true;
     }
 
@@ -448,39 +440,36 @@ bool OmniController::handleSerialFlashCommand(const String& line) {
     // we'd benefit automatically.
     HWCDCSerial.setRxBufferSize(16384);
 
+    // Hand off to the streaming session machinery. startFlashStream pauses
+    // the SPI master, opens the C6 flash session via flashBegin, and spawns
+    // the worker task. Producers (this loop, or the HTTP /omniC6Ota
+    // upload callback) just push bytes through feedFlashStream.
+    if (!startFlashStream(size, 0x0, expectedCrc)) {
+        // startFlashStream prints the specific cause; surface a generic
+        // protocol error to the host.
+        Serial.printf("OMNI_C6_FLASH_ERR begin %d\n", (int)_flasher.lastFlashError());
+        return true;
+    }
+
     Serial.println("OMNI_C6_READY");
     Serial.flush();
 
-    // Streaming pipeline: read from USB-CDC into a kBlockSize accumulator;
-    // call flashWrite once we have a full block (or the final tail).
-    //
-    // CRITICAL: esp_loader_flash_write ALWAYS sends s_flash_write_size bytes
-    // per call regardless of the size argument — when you pass less, it pads
-    // with 0xFF up to s_flash_write_size and writes the full block to flash
-    // (see external/esp-serial-flasher/src/esp_loader.c flash_write). So
-    // every call except the very last MUST be exactly kBlockSize, otherwise
-    // we inject 0xFF padding into the middle of the flashed image and the
-    // C6's flash_verify MD5 fails. Earlier 4096-byte chunks failed with
-    // ESP_LOADER_ERROR_INVALID_PARAM; capping at kBlockSize made the param
-    // valid but introduced silent corruption whenever a chunk was short.
-    constexpr uint32_t kBlockSize = omni::OmniUartFlasher::kBlockSize;
-    static uint8_t block[kBlockSize];
-    uint32_t blockFill = 0;
-    uint32_t runningCrc = 0;
-    uint32_t received = 0;
+    // Pump bytes from USB-CDC into the stream buffer until the worker has
+    // consumed `size` bytes (which we observe by watching flashStreamActive).
+    // The worker handles all the CRC, block-fill, flashWrite, finish/abort
+    // logic — this loop is now just a producer.
+    uint32_t fed = 0;
     uint32_t lastByteMs = millis();
     uint32_t lastProgressLog = 0;
-
-    while (received < size) {
-        // 30 s inter-byte timeout. We've seen Windows' USB-CDC driver leave
-        // the last few KB of a transfer stuck in its kernel buffer for
-        // tens of seconds before pushing them across; tighter timeouts
-        // surface as spurious rx_timeout near the very end of the stream.
+    static uint8_t scratch[1024];
+    while (_flashStreamActive && fed < size) {
         if (millis() - lastByteMs > 30000) {
-            _flasher.flashAbort();
+            // Producer-side timeout — nothing has come from USB-CDC for 30 s.
+            // Bail; the worker's own 30 s timeout would also catch this, but
+            // surfacing it from the producer side gives a clearer error.
+            abortFlashStream();
             Serial.printf("OMNI_C6_FLASH_ERR rx_timeout %u_of_%u\n",
-                          (unsigned)received, (unsigned)size);
-            if (linkWasRunning) _spiMaster.start();
+                          (unsigned)fed, (unsigned)size);
             return true;
         }
         int avail = Serial.available();
@@ -488,85 +477,66 @@ bool OmniController::handleSerialFlashCommand(const String& line) {
             yield();
             continue;
         }
-        uint32_t toRead = (uint32_t)avail;
-        // Cap at remaining space in the current block (so we fill exactly).
-        uint32_t blockSpace = kBlockSize - blockFill;
-        if (toRead > blockSpace) toRead = blockSpace;
-        // Cap at remaining bytes in the whole image.
-        if (toRead > (size - received)) toRead = size - received;
-
-        size_t got = Serial.readBytes((char*)(block + blockFill), toRead);
+        size_t toRead = (size_t)avail;
+        if (toRead > sizeof(scratch))   toRead = sizeof(scratch);
+        if (toRead > (size_t)(size - fed)) toRead = (size_t)(size - fed);
+        size_t got = Serial.readBytes((char*)scratch, toRead);
         if (got == 0) {
             yield();
             continue;
         }
-        runningCrc = esp_rom_crc32_le(runningCrc, block + blockFill, got);
-        blockFill += (uint32_t)got;
-        received += (uint32_t)got;
+        // Block up to 1 s pushing into the stream buffer. If the worker is
+        // backlogged (UART can't drain fast enough) we briefly stall the
+        // USB-CDC reader — that's fine, USB-CDC has its own RX queue.
+        size_t pushed = feedFlashStream(scratch, got, 1000);
+        if (pushed != got) {
+            // Worker died or buffer permanently full — bail.
+            abortFlashStream();
+            Serial.printf("OMNI_C6_FLASH_ERR feed_short pushed=%u got=%u offset=%u\n",
+                          (unsigned)pushed, (unsigned)got, (unsigned)fed);
+            return true;
+        }
+        fed += (uint32_t)got;
         lastByteMs = millis();
 
-        // Flush a full block, OR flush whatever's left when we've hit `size`
-        // (final partial block). flashWrite for the partial tail is the only
-        // call that may legitimately pass < kBlockSize.
-        bool full     = (blockFill == kBlockSize);
-        bool finalTail = (received == size && blockFill > 0);
-        if (full || finalTail) {
-            if (!_flasher.flashWrite(block, blockFill)) {
-                _flasher.flashAbort();
-                Serial.printf("OMNI_C6_FLASH_ERR write %d at_offset=%u\n",
-                              (int)_flasher.lastFlashError(),
-                              (unsigned)(received - blockFill));
-                if (linkWasRunning) _spiMaster.start();
-                return true;
-            }
-            blockFill = 0;
-        }
-
-        // Progress log every ~32 KB. Diagnostic only — PC client filters
-        // anything that's not OMNI_C6_*. Helps us see where stalls happen.
-        if (received - lastProgressLog >= 32 * 1024 || received == size) {
+        if (fed - lastProgressLog >= 32 * 1024 || fed == size) {
             Serial.printf("OmniSerial: rx %u/%u (%u%%)\n",
-                          (unsigned)received, (unsigned)size,
-                          (unsigned)((uint64_t)received * 100 / size));
-            lastProgressLog = received;
+                          (unsigned)fed, (unsigned)size,
+                          (unsigned)((uint64_t)fed * 100 / size));
+            lastProgressLog = fed;
         }
     }
 
-    if (runningCrc != expectedCrc) {
-        _flasher.flashAbort();
-        Serial.printf("OMNI_C6_CRC_FAIL expected=%08x actual=%08x size=%u\n",
-                      (unsigned)expectedCrc, (unsigned)runningCrc, (unsigned)size);
-        if (linkWasRunning) _spiMaster.start();
-        return true;
-    }
-    Serial.printf("OMNI_C6_RX_OK %u bytes crc=%08x\n",
-                  (unsigned)size, (unsigned)runningCrc);
+    // All bytes pushed. Wait for the worker to finalise (it handles CRC
+    // verification, flashFinish/abort, link-master restart, etc).
+    Serial.printf("OMNI_C6_RX_OK %u bytes\n", (unsigned)fed);
     Serial.flush();
 
-    if (!_flasher.flashFinish(true /*reboot*/)) {
-        Serial.printf("OMNI_C6_FLASH_ERR finish %d\n", (int)_flasher.lastFlashError());
-        if (linkWasRunning) _spiMaster.start();
+    // Worker keeps _flashStreamActive true until it's fully drained the
+    // stream buffer, called flashFinish (which does the EN reset), and
+    // restarted the link master. Bound the wait at 90 s — that's well
+    // beyond any normal flashFinish (verify + finish + EN pulse < 5 s).
+    uint32_t waitStart = millis();
+    while (_flashStreamActive && (millis() - waitStart) < 90000) {
+        delay(50);
+    }
+    if (_flashStreamActive) {
+        Serial.println("OMNI_C6_FLASH_ERR worker_timeout");
+        abortFlashStream();
+        return true;
+    }
+
+    if (!_flashStreamOk) {
+        Serial.printf("OMNI_C6_FLASH_ERR %s code=%d\n",
+                      _flashStreamErrorMsg ? _flashStreamErrorMsg : "unknown",
+                      (int)_flashStreamErrorCode);
         return true;
     }
 
     Serial.printf("OMNI_C6_FLASH_OK size=%u flash_ms=%u\n",
-                  (unsigned)size, (unsigned)_flasher.lastFlashMs());
-
-    // Give the freshly-flashed C6 a moment to come up before re-arming the
-    // link IRQ — the C6's startup sequence drives GPIO9 and we don't want
-    // spurious edges to flood the wake semaphore before the firmware has
-    // settled.
-    if (linkWasRunning) {
-        delay(200);
-        // Reset link state so the freshly-flashed C6 has to re-handshake.
-        if (_linkMutex && xSemaphoreTake(_linkMutex, portMAX_DELAY) == pdTRUE) {
-            _link.hello_acked = false;
-            _link.c6_proto = -1;
-            _link.c6_fw[0] = '\0';
-            xSemaphoreGive(_linkMutex);
-        }
-        _spiMaster.start();
-    }
+                  (unsigned)size, (unsigned)_flashStreamDurationMs);
+    // Worker has already done the EN reset (via flashFinish), reset link
+    // state, and restarted the SPI master — nothing else to do here.
     return true;
 }
 
@@ -700,4 +670,220 @@ void OmniController::ctrlPumpLoop() {
             vTaskDelay(pdMS_TO_TICKS(5000));
         }
     }
+}
+
+// ── Streaming flash session (M-β.3) ────────────────────────────────────────
+
+namespace {
+// Stream buffer between producer (HTTP upload callback or USB-CDC reader)
+// and the worker task. 32 KB is enough to absorb a few seconds of UART
+// drain backlog without back-pressuring the producer; sized so AsyncTCP's
+// upload chunks (typically ≤8 KB) fit even when the worker is mid-block.
+constexpr size_t kFlashStreamCapacity = 32 * 1024;
+constexpr size_t kFlashStreamTrigger  = 1;  // wake worker on any byte
+constexpr uint32_t kFlashWorkerStackBytes = 8192;
+constexpr UBaseType_t kFlashWorkerPriority = 5;
+constexpr BaseType_t kFlashWorkerCore = 1;  // away from AsyncTCP on Core 0
+}  // namespace
+
+bool OmniController::startFlashStream(uint32_t imageSize, uint32_t flashOffset,
+                                      uint32_t expectedCrc) {
+    if (_flashStreamActive) {
+        Serial.println("OmniController: flash stream already active");
+        return false;
+    }
+    if (imageSize == 0 || imageSize > 8 * 1024 * 1024) {
+        Serial.printf("OmniController: bad flash size %u\n", (unsigned)imageSize);
+        return false;
+    }
+    if (!_flasher.began()) {
+        Serial.println("OmniController: flasher not begun");
+        return false;
+    }
+
+    // Lazy-init the stream buffer + completion semaphore. They persist
+    // across sessions (cheaper than recreating them every time).
+    if (_flashStream == nullptr) {
+        _flashStream = xStreamBufferCreate(kFlashStreamCapacity, kFlashStreamTrigger);
+    }
+    if (_flashWorkerDone == nullptr) {
+        _flashWorkerDone = xSemaphoreCreateBinary();
+    }
+    if (_flashStream == nullptr || _flashWorkerDone == nullptr) {
+        Serial.println("OmniController: flash stream alloc failed");
+        return false;
+    }
+
+    // Drain leftovers from any previous session and clear the completion
+    // signal so the new worker starts from a known state.
+    xStreamBufferReset(_flashStream);
+    xSemaphoreTake(_flashWorkerDone, 0);
+
+    // Pause the SPI master — flashBegin (called inside the worker)
+    // repurposes BOOT/HANDSHAKE as an output, which would fight the
+    // master's IRQ wiring. Worker restarts the master on its way out.
+    _flashStreamLinkWasRunning = _spiMaster.taskRunning();
+    if (_flashStreamLinkWasRunning) _spiMaster.stop();
+
+    _flashStreamSize         = imageSize;
+    _flashStreamOffset       = flashOffset;
+    _flashStreamExpectedCrc  = expectedCrc;
+    _flashStreamAborted      = false;
+    _flashStreamOk           = false;
+    _flashStreamErrorCode    = 0;
+    _flashStreamErrorMsg     = nullptr;
+    _flashStreamBytesProcessed = 0;
+    _flashStreamDurationMs   = 0;
+    _flashStreamRunningCrc   = 0;
+    _flashStreamStartMs      = millis();
+    _flashStreamActive       = true;
+
+    BaseType_t ok = xTaskCreatePinnedToCore(
+        &OmniController::flashWorkerTrampoline,
+        "OmniFlash",
+        kFlashWorkerStackBytes,
+        this,
+        kFlashWorkerPriority,
+        &_flashWorkerTask,
+        kFlashWorkerCore);
+    if (ok != pdPASS) {
+        Serial.println("OmniController: flash worker task create failed");
+        _flashStreamActive = false;
+        if (_flashStreamLinkWasRunning) _spiMaster.start();
+        return false;
+    }
+
+    Serial.printf("OmniController: flash stream started size=%u offset=0x%X\n",
+                  (unsigned)imageSize, (unsigned)flashOffset);
+    return true;
+}
+
+size_t OmniController::feedFlashStream(const uint8_t* data, size_t len,
+                                       uint32_t timeoutMs) {
+    if (!_flashStreamActive || _flashStream == nullptr) return 0;
+    if (data == nullptr || len == 0) return 0;
+    return xStreamBufferSend(_flashStream, data, len, pdMS_TO_TICKS(timeoutMs));
+}
+
+void OmniController::abortFlashStream() {
+    if (!_flashStreamActive) return;
+    _flashStreamAborted = true;
+    // Wake the worker if it's blocked in xStreamBufferReceive — sending
+    // any byte will return early, then the worker sees _flashStreamAborted
+    // on its next iteration and bails.
+    if (_flashStream) xStreamBufferReset(_flashStream);
+}
+
+void OmniController::flashWorkerTrampoline(void* arg) {
+    static_cast<OmniController*>(arg)->flashWorkerLoop();
+    vTaskDelete(nullptr);
+}
+
+void OmniController::flashWorkerLoop() {
+    // The worker owns the flash session for its lifetime. Open the C6
+    // bootloader connection here (in the worker task's context, NOT on
+    // AsyncTCP) so esp-serial-flasher's blocking UART work happens away
+    // from any latency-sensitive callers.
+    if (!_flasher.flashBegin(_flashStreamSize, _flashStreamOffset)) {
+        finishFlashWorker(false, _flasher.lastFlashError(), "flashBegin failed");
+        return;
+    }
+
+    constexpr uint32_t kBlockSize = omni::OmniUartFlasher::kBlockSize;
+    static uint8_t block[kBlockSize];
+    uint32_t blockFill  = 0;
+    uint32_t totalRead  = 0;
+    uint32_t crc        = 0;
+
+    while (totalRead < _flashStreamSize) {
+        if (_flashStreamAborted) {
+            _flasher.flashAbort();
+            finishFlashWorker(false, -2, "aborted");
+            return;
+        }
+
+        uint32_t toRead = kBlockSize - blockFill;
+        if (toRead > _flashStreamSize - totalRead) {
+            toRead = _flashStreamSize - totalRead;
+        }
+
+        // 30 s inter-byte timeout. If the producer goes silent (HTTP
+        // connection drop, USB-CDC stall) the worker bails rather than
+        // hanging the C6 in stub mode forever.
+        size_t got = xStreamBufferReceive(_flashStream,
+                                          block + blockFill,
+                                          toRead,
+                                          pdMS_TO_TICKS(30000));
+        if (got == 0) {
+            _flasher.flashAbort();
+            finishFlashWorker(false, -1, "rx_timeout");
+            return;
+        }
+
+        crc = esp_rom_crc32_le(crc, block + blockFill, got);
+        blockFill += (uint32_t)got;
+        totalRead += (uint32_t)got;
+
+        bool full      = (blockFill == kBlockSize);
+        bool finalTail = (totalRead == _flashStreamSize && blockFill > 0);
+        if (full || finalTail) {
+            if (!_flasher.flashWrite(block, blockFill)) {
+                _flasher.flashAbort();
+                finishFlashWorker(false, _flasher.lastFlashError(),
+                                  "flashWrite failed");
+                return;
+            }
+            blockFill = 0;
+        }
+
+        _flashStreamBytesProcessed = totalRead;
+        _flashStreamRunningCrc     = crc;
+    }
+
+    // Producer-supplied CRC check (USB-CDC path supplies a CRC; HTTP path
+    // can pass 0 to skip — multipart uploads are TCP-checksummed already).
+    if (_flashStreamExpectedCrc != 0 && crc != _flashStreamExpectedCrc) {
+        _flasher.flashAbort();
+        finishFlashWorker(false, -3, "crc_mismatch");
+        return;
+    }
+
+    // flashFinish handles MD5 verify + EN-pulse reset of the C6.
+    if (!_flasher.flashFinish(true /*reboot*/)) {
+        finishFlashWorker(false, _flasher.lastFlashError(), "flashFinish failed");
+        return;
+    }
+
+    finishFlashWorker(true, 0, "ok");
+}
+
+void OmniController::finishFlashWorker(bool ok, int32_t errorCode, const char* msg) {
+    _flashStreamOk         = ok;
+    _flashStreamErrorCode  = errorCode;
+    _flashStreamErrorMsg   = msg;
+    _flashStreamDurationMs = millis() - _flashStreamStartMs;
+    Serial.printf("OmniController: flash worker exit ok=%d err=%d msg=%s ms=%u\n",
+                  ok ? 1 : 0, (int)errorCode, msg ? msg : "", (unsigned)_flashStreamDurationMs);
+
+    // Restart the link master if it was running before the session opened.
+    // The flashFinish above already did the EN pulse, so the C6 is rebooting
+    // into the freshly-flashed firmware; give it 200 ms to settle before
+    // we re-arm the IRQ.
+    if (_flashStreamLinkWasRunning) {
+        vTaskDelay(pdMS_TO_TICKS(200));
+        if (_linkMutex && xSemaphoreTake(_linkMutex, portMAX_DELAY) == pdTRUE) {
+            _link.hello_acked = false;
+            _link.c6_proto    = -1;
+            _link.c6_fw[0]    = '\0';
+            xSemaphoreGive(_linkMutex);
+        }
+        _spiMaster.start();
+    }
+
+    // Clear the active flag LAST so any external waiter (USB-CDC handler,
+    // /omniC6Status poller) sees the result fields populated before active
+    // goes false.
+    _flashStreamActive = false;
+    _flashWorkerTask   = nullptr;
+    if (_flashWorkerDone) xSemaphoreGive(_flashWorkerDone);
 }

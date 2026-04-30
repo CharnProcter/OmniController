@@ -6,6 +6,7 @@
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
+#include "freertos/stream_buffer.h"
 #include "freertos/task.h"
 
 #include "FlexibleEndpoints.h"
@@ -52,6 +53,31 @@ public:
     // when handling OMNI_C6_FLASH (~30 s for a typical image).
     bool handleSerialCommand(const String& line);
 
+    // ── Streaming flash session API ────────────────────────────────────────
+    //
+    // Used by both the USB-CDC OMNI_C6_FLASH path and the HTTP /omniC6Ota
+    // multipart upload path. The producer (HTTP upload callback or USB-CDC
+    // reader) calls feedFlashStream() to push bytes; a dedicated worker task
+    // on Core 1 drains them through OmniUartFlasher::flashWrite. Isolating
+    // esp-serial-flasher's blocking UART work from AsyncTCP's task is what
+    // makes the HTTP path safe — running flashWrite on AsyncTCP previously
+    // produced heap corruption in the WiFi RX path (project memory:
+    // project_http_c6_ota_deferred.md).
+    //
+    // Lifecycle: startFlashStream → repeated feedFlashStream → worker
+    // detects `received == size` and finalises automatically.
+    bool startFlashStream(uint32_t imageSize, uint32_t flashOffset,
+                          uint32_t expectedCrc);
+    size_t feedFlashStream(const uint8_t* data, size_t len, uint32_t timeoutMs);
+    void abortFlashStream();
+    bool flashStreamActive() const { return _flashStreamActive; }
+    bool flashStreamLastOk() const { return _flashStreamOk; }
+    int32_t flashStreamLastError() const { return _flashStreamErrorCode; }
+    const char* flashStreamLastErrorMsg() const { return _flashStreamErrorMsg ? _flashStreamErrorMsg : ""; }
+    uint32_t flashStreamBytesProcessed() const { return _flashStreamBytesProcessed; }
+    uint32_t flashStreamDurationMs() const { return _flashStreamDurationMs; }
+    uint32_t flashStreamRunningCrc() const { return _flashStreamRunningCrc; }
+
 private:
     struct LinkState {
         bool     hello_acked      = false;
@@ -97,4 +123,29 @@ private:
     SemaphoreHandle_t _linkMutex   = nullptr;
     TaskHandle_t      _ctrlPumpTask = nullptr;
     uint16_t          _ctrlTxSeq    = 1;
+
+    // Flash-stream session state (M-β.3 OTA refactor). The worker task
+    // owns the active flash session; producers feed bytes through the
+    // stream buffer. All volatile fields are read/written from both the
+    // producer and worker tasks.
+    static void flashWorkerTrampoline(void* arg);
+    void flashWorkerLoop();
+    void finishFlashWorker(bool ok, int32_t errorCode, const char* msg);
+
+    StreamBufferHandle_t _flashStream     = nullptr;
+    TaskHandle_t         _flashWorkerTask = nullptr;
+    SemaphoreHandle_t    _flashWorkerDone = nullptr;
+    volatile bool        _flashStreamActive   = false;
+    volatile bool        _flashStreamAborted  = false;
+    bool                 _flashStreamLinkWasRunning = false;
+    uint32_t             _flashStreamSize     = 0;
+    uint32_t             _flashStreamOffset   = 0;
+    uint32_t             _flashStreamExpectedCrc = 0;
+    uint32_t             _flashStreamStartMs  = 0;
+    bool                 _flashStreamOk       = false;
+    int32_t              _flashStreamErrorCode = 0;
+    const char*          _flashStreamErrorMsg  = nullptr;
+    uint32_t             _flashStreamBytesProcessed = 0;
+    uint32_t             _flashStreamDurationMs = 0;
+    uint32_t             _flashStreamRunningCrc = 0;
 };
