@@ -250,13 +250,32 @@ bool OmniUartFlasher::flashFinish(bool reboot) {
         return false;
     }
 
-    esp_loader_error_t err = esp_loader_flash_finish(reboot);
+    // Tell the stub we're done — but pass reboot=false. The stub's own
+    // "reboot" path just *jumps* to the firmware entry point, leaving the
+    // C6's peripherals (SPI controller, GPIO config, watchdog state, etc.)
+    // in whatever the stub left them. The freshly-flashed firmware then
+    // initialises on top of dirty hardware state and SPI-slave transactions
+    // silently fail. We do a clean EN pulse below to force a true hardware
+    // reset before the new firmware runs.
+    esp_loader_error_t err = esp_loader_flash_finish(false);
     _lastFlashMs = millis() - _flashStartMs;
     _flashActive = false;
 
-    // Don't deinit the UART driver — it's persistent. Just hand the strap
-    // pins back to INPUT_PULLUP so HANDSHAKE-from-C6 (M-γ) isn't blocked.
+    // Hand the strap pins back to INPUT_PULLUP first (so the EN pulse below
+    // is a clean output-low → input-pullup transition rather than fighting
+    // a residual OUTPUT-HIGH drive).
     releaseStrapPins();
+
+    // Hard reset if requested — pulls EN low briefly so the C6 reboots into
+    // its newly-flashed image with all peripherals in their reset state.
+    // This is the actual semantic difference between flashFinish(true) and
+    // flashFinish(false) post-Push-C: not "tell the stub to jump" (which
+    // doesn't really reset) but "force a hardware reset ourselves."
+    if (reboot) {
+        driveEnLow();
+        delay(50);
+        releaseEn();
+    }
     recordAction(FlasherAction::None);
 
     if (err != ESP_LOADER_SUCCESS) {
@@ -267,8 +286,9 @@ bool OmniUartFlasher::flashFinish(bool reboot) {
         return false;
     }
 
-    Serial.printf("OmniUartFlasher: flash done + verified in %lu ms\n",
-                  (unsigned long)_lastFlashMs);
+    Serial.printf("OmniUartFlasher: flash done + verified in %lu ms%s\n",
+                  (unsigned long)_lastFlashMs,
+                  reboot ? " (C6 reset)" : "");
     _lastFlashOk = true;
     return true;
 }
