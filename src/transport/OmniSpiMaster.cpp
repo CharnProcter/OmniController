@@ -8,6 +8,12 @@ namespace {
 constexpr spi_host_device_t kHost     = SPI3_HOST;
 constexpr int               kClockHz  = 20 * 1000 * 1000;  // 20 MHz; raise after stability proven
 constexpr uint32_t          kIdlePeriodMs = 1000;          // wake at least once per second
+// Minimum gap between transactions, even if HANDSHAKE keeps firing the IRQ.
+// Caps the link at ~50 Hz, which is plenty for heartbeats + log forwarding,
+// and prevents the bus from saturating when a chatty channel keeps the C6's
+// HANDSHAKE asserted continuously (e.g. Push A echo mode where every CTRL
+// keepalive produces an echo response that re-arms HANDSHAKE).
+constexpr uint32_t          kMinTxGapMs   = 20;
 constexpr uint8_t           kTxQueueDepth = 8;
 constexpr uint32_t          kTaskStackBytes = 4096;
 constexpr UBaseType_t       kTaskPriority   = 5;
@@ -205,8 +211,19 @@ void OmniSpiMaster::taskLoop() {
 
     static TxSlot rx{};   // RX scratch (1040 B; static to keep stack small)
     static TxSlot tx{};
+    uint32_t lastTxMs = 0;
 
     while (!_taskShouldStop) {
+        // Enforce the minimum gap between transactions. If the previous
+        // transaction was less than kMinTxGapMs ago, sleep the remainder
+        // before checking the wake semaphore — otherwise a HANDSHAKE that
+        // re-asserts every transaction would let us pump the bus at full
+        // hardware speed.
+        uint32_t now = millis();
+        if (lastTxMs != 0 && now - lastTxMs < kMinTxGapMs) {
+            vTaskDelay(pdMS_TO_TICKS(kMinTxGapMs - (now - lastTxMs)));
+        }
+
         // Wait for: HANDSHAKE IRQ, sendFrame post, or the 1 s idle timer.
         xSemaphoreTake(_wakeSem, pdMS_TO_TICKS(kIdlePeriodMs));
         if (_taskShouldStop) break;
@@ -233,10 +250,11 @@ void OmniSpiMaster::taskLoop() {
             continue;
         }
 
-        const uint32_t now = millis();
+        const uint32_t txMs = millis();
+        lastTxMs = txMs;
         if (_statsMutex && xSemaphoreTake(_statsMutex, 0) == pdTRUE) {
             _stats.tx_frames++;
-            _stats.last_tx_ms = now;
+            _stats.last_tx_ms = txMs;
             xSemaphoreGive(_statsMutex);
         }
 
@@ -261,7 +279,7 @@ void OmniSpiMaster::taskLoop() {
 
         if (_statsMutex && xSemaphoreTake(_statsMutex, 0) == pdTRUE) {
             _stats.rx_frames++;
-            _stats.last_rx_ms = now;
+            _stats.last_rx_ms = txMs;
             xSemaphoreGive(_statsMutex);
         }
 
