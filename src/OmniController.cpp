@@ -289,6 +289,53 @@ void OmniController::registerEndpoints(FlexibleEndpoints* endpoints) {
             return std::pair<String, int>(out, 200);
         });
     endpoints->addEndpoint(c6EchoEndpoint);
+
+    auto c6PollHandshakeEndpoint = FLEXIBLE_ENDPOINT()
+        .route("/omniC6PollHandshake")
+        .summary("Watch the HANDSHAKE pin for activity (alive check)")
+        .description("Polls the C6_HANDSHAKE pin (S3 GPIO12 = bodge wire to "
+                     "C6 GPIO9) for 2.5 seconds at 1 ms intervals and counts "
+                     "transitions. Useful when SPI itself is failing — the C6 "
+                     "firmware blinks GPIO9 ten times at boot before "
+                     "SpiSlaveTask takes over, so a transition count of 20+ "
+                     "means the C6 booted into our firmware. 0 transitions "
+                     "and steady_state=high means either the C6 isn't booting "
+                     "into our firmware or it booted long enough ago that the "
+                     "blink window is over (reset the C6 first via "
+                     "/omniC6Reset and immediately call this).")
+        .params({})
+        .responseType(JSON_RESPONSE)
+        .responseDescription("transition count + steady-state level")
+        .handler([self](std::map<String, String>& /*params*/) -> std::pair<String, int> {
+            const uint32_t windowMs = 2500;
+            const uint32_t startMs = millis();
+            int prev = digitalRead(self->_pins.boot);
+            int transitions = 0;
+            int highCount = 0;
+            int samples = 0;
+            while (millis() - startMs < windowMs) {
+                int v = digitalRead(self->_pins.boot);
+                if (v != prev) transitions++;
+                if (v == HIGH) highCount++;
+                samples++;
+                prev = v;
+                delayMicroseconds(1000);
+            }
+            JsonDocument doc;
+            doc["transitions"]  = transitions;
+            doc["window_ms"]    = windowMs;
+            doc["samples"]      = samples;
+            doc["high_count"]   = highCount;
+            doc["pct_high"]     = samples ? (highCount * 100 / samples) : 0;
+            doc["steady_state"] = (transitions == 0)
+                ? (prev == HIGH ? "high" : "low")
+                : "varying";
+            doc["pin"] = self->_pins.boot;
+            String out;
+            serializeJson(doc, out);
+            return std::pair<String, int>(out, 200);
+        });
+    endpoints->addEndpoint(c6PollHandshakeEndpoint);
 }
 
 bool OmniController::handleSerialCommand(const String& line) {
