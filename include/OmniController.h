@@ -4,7 +4,12 @@
 #include <functional>
 #include <vector>
 
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
+#include "freertos/task.h"
+
 #include "FlexibleEndpoints.h"
+#include "OmniProto.h"
 
 #include "../src/flasher/OmniUartFlasher.h"
 #include "../src/transport/OmniSpiMaster.h"
@@ -48,6 +53,18 @@ public:
     bool handleSerialCommand(const String& line);
 
 private:
+    struct LinkState {
+        bool     hello_acked      = false;
+        uint32_t hello_acked_ms   = 0;
+        int32_t  c6_proto         = -1;
+        char     c6_fw[48]        = {};
+        uint32_t hello_attempts   = 0;
+        uint32_t last_pong_ms     = 0;
+        uint32_t last_pong_rtt_ms = 0;
+        uint32_t last_log_ms      = 0;
+        uint32_t log_lines        = 0;
+    };
+
     void registerEndpoints(FlexibleEndpoints* endpoints);
     bool handleSerialFlashCommand(const String& line);
 
@@ -58,8 +75,26 @@ private:
     // would otherwise fight the master task's IRQ wiring.
     void withSpiSuspended(std::function<void()> body);
 
+    // Link-management plumbing (Push C). The frame handler runs on the SPI
+    // master task; the pump task drives hello/ping cadence; everything that
+    // mutates _link goes through _linkMutex.
+    void onLinkFrame(omni::Channel channel, uint8_t flags, uint16_t seq,
+                     const uint8_t* payload, uint16_t payloadLen);
+    void handleCtrlFrame(uint8_t flags, uint16_t seq,
+                         const uint8_t* payload, uint16_t payloadLen);
+    void handleLogFrame(const uint8_t* payload, uint16_t payloadLen);
+    void sendHello();
+    void sendPing();
+    static void ctrlPumpTrampoline(void* arg);
+    void ctrlPumpLoop();
+
     bool _began = false;
     OmniPins _pins{};
     omni::OmniUartFlasher _flasher;
     omni::OmniSpiMaster   _spiMaster;
+
+    LinkState         _link{};
+    SemaphoreHandle_t _linkMutex   = nullptr;
+    TaskHandle_t      _ctrlPumpTask = nullptr;
+    uint16_t          _ctrlTxSeq    = 1;
 };

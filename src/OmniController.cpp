@@ -17,18 +17,30 @@ bool OmniController::begin(FlexibleEndpoints* endpoints, const OmniPins& pins) {
     _flasher.begin(_pins.en, _pins.boot, _pins.uart_tx, _pins.uart_rx);
     _spiMaster.begin(_pins.spi_cs, _pins.spi_mosi, _pins.spi_miso, _pins.spi_clk, _pins.boot);
 
-    // Push B: launch the async link task. It owns the SPI device after this
-    // point — the synchronous transact() path is locked out (still useful
-    // pre-start for the M-γ Push A echo test, hence the strict-once guard
-    // here rather than tying it into begin()).
+    // Push C: link state + frame dispatch. The handler is registered BEFORE
+    // start() so the very first inbound frame finds a wired-up callback.
+    _linkMutex = xSemaphoreCreateMutex();
+    OmniController* selfPtr = this;
+    _spiMaster.setFrameHandler([selfPtr](omni::Channel ch, uint8_t flags,
+                                         uint16_t seq, const uint8_t* payload,
+                                         uint16_t len) {
+        selfPtr->onLinkFrame(ch, flags, seq, payload, len);
+    });
+
+    // Push B: launch the async link task. It owns the SPI device from here.
     _spiMaster.start();
+
+    // Push C: pump task drives the hello/ping cadence so the link bring-up
+    // doesn't depend on someone hitting an endpoint.
+    xTaskCreatePinnedToCore(&OmniController::ctrlPumpTrampoline,
+                            "OmniCtrlPump", 4096, this, 4, &_ctrlPumpTask, 1);
 
     if (endpoints) {
         registerEndpoints(endpoints);
     }
 
     _began = true;
-    Serial.println("OmniController: initialized (M-gamma.B)");
+    Serial.println("OmniController: initialized (M-gamma.C)");
     return true;
 }
 
@@ -72,7 +84,7 @@ void OmniController::registerEndpoints(FlexibleEndpoints* endpoints) {
             doc["fw"] = OMNI_S3_FW_VERSION;
             doc["proto"] = OMNI_PROTO_VERSION;
             doc["began"] = self->_began;
-            doc["milestone"] = "M-beta.1";
+            doc["milestone"] = "M-gamma.C";
             JsonArray drivers = doc["drivers"].to<JsonArray>();
             (void)drivers;  // populated as drivers register in M-zeta+
             String out;
@@ -132,6 +144,24 @@ void OmniController::registerEndpoints(FlexibleEndpoints* endpoints) {
             link["handshake_irqs"] = s.handshake_irqs;
             link["last_rx_ms_ago"] = (s.last_rx_ms == 0) ? (uint32_t)0 : (now - s.last_rx_ms);
             link["last_tx_ms_ago"] = (s.last_tx_ms == 0) ? (uint32_t)0 : (now - s.last_tx_ms);
+
+            // Push C: hello/heartbeat handshake + log forwarding state.
+            // link.up is the canonical "is the C6 actually responding to
+            // our protocol?" indicator. Distinct from task_running, which
+            // only confirms the master loop is alive.
+            OmniController::LinkState ls{};
+            if (self->_linkMutex && xSemaphoreTake(self->_linkMutex, portMAX_DELAY) == pdTRUE) {
+                ls = self->_link;
+                xSemaphoreGive(self->_linkMutex);
+            }
+            link["up"]               = ls.hello_acked;
+            link["c6_proto"]         = ls.c6_proto;
+            link["c6_fw"]            = (const char*)ls.c6_fw;
+            link["hello_attempts"]   = ls.hello_attempts;
+            link["last_pong_ms_ago"] = (ls.last_pong_ms == 0) ? (uint32_t)0 : (now - ls.last_pong_ms);
+            link["last_pong_rtt_ms"] = ls.last_pong_rtt_ms;
+            link["log_lines"]        = ls.log_lines;
+            link["last_log_ms_ago"]  = (ls.last_log_ms == 0) ? (uint32_t)0 : (now - ls.last_log_ms);
 
             String out;
             serializeJson(doc, out);
@@ -528,7 +558,146 @@ bool OmniController::handleSerialFlashCommand(const String& line) {
     // settled.
     if (linkWasRunning) {
         delay(200);
+        // Reset link state so the freshly-flashed C6 has to re-handshake.
+        if (_linkMutex && xSemaphoreTake(_linkMutex, portMAX_DELAY) == pdTRUE) {
+            _link.hello_acked = false;
+            _link.c6_proto = -1;
+            _link.c6_fw[0] = '\0';
+            xSemaphoreGive(_linkMutex);
+        }
         _spiMaster.start();
     }
     return true;
+}
+
+// ── Link manager (Push C) ──────────────────────────────────────────────────
+
+void OmniController::onLinkFrame(omni::Channel ch, uint8_t flags, uint16_t seq,
+                                 const uint8_t* payload, uint16_t payloadLen) {
+    switch (ch) {
+        case omni::Channel::Ctrl:
+            handleCtrlFrame(flags, seq, payload, payloadLen);
+            break;
+        case omni::Channel::Log:
+            handleLogFrame(payload, payloadLen);
+            break;
+        // OTA (M-δ), Thread/Zigbee/Matter (M-θ/M-ι), Radio (M-κ) handlers
+        // attach in their respective milestones. Drop unknowns silently.
+        default:
+            break;
+    }
+}
+
+void OmniController::handleCtrlFrame(uint8_t /*flags*/, uint16_t /*seq*/,
+                                     const uint8_t* payload, uint16_t payloadLen) {
+    if (payload == nullptr || payloadLen == 0) return;
+
+    JsonDocument doc;
+    if (deserializeJson(doc, payload, payloadLen)) return;
+    const char* op = doc["op"] | "";
+
+    if (strcmp(op, omni::ctrl::kOpHelloAck) == 0) {
+        bool firstUp = false;
+        if (_linkMutex && xSemaphoreTake(_linkMutex, portMAX_DELAY) == pdTRUE) {
+            firstUp = !_link.hello_acked;
+            _link.hello_acked    = true;
+            _link.hello_acked_ms = millis();
+            _link.c6_proto       = doc["proto"] | -1;
+            const char* fw = doc["fw"] | "";
+            strncpy(_link.c6_fw, fw, sizeof(_link.c6_fw) - 1);
+            _link.c6_fw[sizeof(_link.c6_fw) - 1] = '\0';
+            xSemaphoreGive(_linkMutex);
+        }
+        if (firstUp) {
+            Serial.printf("OmniController: link UP (c6_proto=%d c6_fw=%s)\n",
+                          (int)(doc["proto"] | -1),
+                          (const char*)(doc["fw"] | ""));
+        }
+    } else if (strcmp(op, omni::ctrl::kOpPong) == 0) {
+        uint32_t origTs = doc["ts"] | 0u;
+        uint32_t now    = millis();
+        if (_linkMutex && xSemaphoreTake(_linkMutex, portMAX_DELAY) == pdTRUE) {
+            _link.last_pong_ms     = now;
+            _link.last_pong_rtt_ms = (origTs && now >= origTs) ? (now - origTs) : 0;
+            xSemaphoreGive(_linkMutex);
+        }
+    }
+    // Other CTRL ops (OTA, radio role changes) handled in later milestones.
+}
+
+void OmniController::handleLogFrame(const uint8_t* payload, uint16_t payloadLen) {
+    if (payload == nullptr || payloadLen == 0) return;
+
+    // Print "[c6] <line>". SerialTee captures Serial.print and replays it on
+    // the WebSocket — so C6 logs land in the dashboard alongside S3 logs
+    // automatically, no extra plumbing.
+    Serial.print("[c6] ");
+    for (uint16_t i = 0; i < payloadLen; i++) {
+        char c = static_cast<char>(payload[i]);
+        if (c == '\n' || c == '\t' || (c >= 0x20 && c < 0x7F)) Serial.write(c);
+        else Serial.write('?');
+    }
+    Serial.println();
+
+    if (_linkMutex && xSemaphoreTake(_linkMutex, 0) == pdTRUE) {
+        _link.last_log_ms = millis();
+        _link.log_lines++;
+        xSemaphoreGive(_linkMutex);
+    }
+}
+
+void OmniController::sendHello() {
+    JsonDocument doc;
+    doc["op"]    = omni::ctrl::kOpHello;
+    doc["proto"] = OMNI_PROTO_VERSION;
+    doc["fw"]    = OMNI_S3_FW_VERSION;
+    char buf[200];
+    size_t n = serializeJson(doc, buf, sizeof(buf));
+    if (n == 0) return;
+    if (_spiMaster.sendFrame(omni::Channel::Ctrl, omni::FlagAckReq,
+                             _ctrlTxSeq++,
+                             reinterpret_cast<const uint8_t*>(buf),
+                             static_cast<uint16_t>(n))) {
+        if (_linkMutex && xSemaphoreTake(_linkMutex, portMAX_DELAY) == pdTRUE) {
+            _link.hello_attempts++;
+            xSemaphoreGive(_linkMutex);
+        }
+    }
+}
+
+void OmniController::sendPing() {
+    JsonDocument doc;
+    doc["op"] = omni::ctrl::kOpPing;
+    doc["ts"] = millis();
+    char buf[80];
+    size_t n = serializeJson(doc, buf, sizeof(buf));
+    if (n == 0) return;
+    _spiMaster.sendFrame(omni::Channel::Ctrl, 0, _ctrlTxSeq++,
+                         reinterpret_cast<const uint8_t*>(buf),
+                         static_cast<uint16_t>(n));
+}
+
+void OmniController::ctrlPumpTrampoline(void* arg) {
+    static_cast<OmniController*>(arg)->ctrlPumpLoop();
+    vTaskDelete(nullptr);
+}
+
+void OmniController::ctrlPumpLoop() {
+    // Initial 250 ms grace so the SPI master task and the C6's slave task
+    // both reach steady state before we start probing the link.
+    vTaskDelay(pdMS_TO_TICKS(250));
+    while (true) {
+        bool acked = false;
+        if (_linkMutex && xSemaphoreTake(_linkMutex, portMAX_DELAY) == pdTRUE) {
+            acked = _link.hello_acked;
+            xSemaphoreGive(_linkMutex);
+        }
+        if (!acked) {
+            sendHello();
+            vTaskDelay(pdMS_TO_TICKS(1000));
+        } else {
+            sendPing();
+            vTaskDelay(pdMS_TO_TICKS(5000));
+        }
+    }
 }

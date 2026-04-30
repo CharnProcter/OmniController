@@ -1,6 +1,6 @@
 {
     "name": "OmniController",
-    "version": "0.2.0",
+    "version": "0.3.0",
     "description": "Local-first IoT omni-controller. Discovers and controls smart-home devices over WiFi/BLE/Zigbee/Thread/Matter via an ESP32-S3 + ESP32-C6 architecture.",
     "keywords": "esp32, iot, zigbee, thread, matter, mdns, ssdp, ble, smarthome",
     "repository": {
