@@ -11,6 +11,21 @@
 #define OMNI_S3_FW_VERSION "omni-0.1.0"
 #endif
 
+namespace {
+// Stream buffer between producer (HTTP upload callback or USB-CDC reader)
+// and the worker task. Kept deliberately small — when full, feedFlashStream
+// retries on partial writes which naturally back-pressures TCP through
+// AsyncTCP. 16 KB absorbs ~10 chunks of 1.4 KB HTTP payload before the
+// producer starts blocking, and at the C6's UART drain rate (~12 KB/s)
+// the buffer empties in ~1.3 s — comfortable per-call latencies on
+// AsyncTCP, no extended stalls.
+constexpr size_t      kFlashStreamCapacity   = 16 * 1024;
+constexpr size_t      kFlashStreamTrigger    = 1;  // wake worker on any byte
+constexpr uint32_t    kFlashWorkerStackBytes = 8192;
+constexpr UBaseType_t kFlashWorkerPriority   = 5;
+constexpr BaseType_t  kFlashWorkerCore       = 1;  // away from AsyncTCP on Core 0
+}  // namespace
+
 bool OmniController::begin(FlexibleEndpoints* endpoints, const OmniPins& pins) {
     if (_began) return true;
 
@@ -705,24 +720,6 @@ void OmniController::ctrlPumpLoop() {
 
 // ── Streaming flash session (M-β.3) ────────────────────────────────────────
 
-namespace {
-// Stream buffer between producer (HTTP upload callback or USB-CDC reader)
-// and the worker task. Sized large enough to absorb the network burst
-// during the ~2 s flashBegin window where the worker is busy and can't
-// drain. 128 KB internal RAM gives us ~10 s of UART-drain headroom at
-// 12 KB/s, which beats any realistic flashBegin duration.
-//
-// Allocation happens once at begin() (heap is fresh) and the buffer is
-// reused across sessions. Earlier attempts to lazy-create at session
-// start failed because by upload time the heap was fragmented and even
-// 64 KB contiguous internal couldn't be obtained, let alone 1 MB PSRAM.
-constexpr size_t kFlashStreamCapacity = 128 * 1024;
-constexpr size_t kFlashStreamTrigger  = 1;  // wake worker on any byte
-constexpr uint32_t kFlashWorkerStackBytes = 8192;
-constexpr UBaseType_t kFlashWorkerPriority = 5;
-constexpr BaseType_t kFlashWorkerCore = 1;  // away from AsyncTCP on Core 0
-}  // namespace
-
 bool OmniController::startFlashStream(uint32_t imageSize, uint32_t flashOffset,
                                       uint32_t expectedCrc) {
     if (_flashStreamActive) {
@@ -793,7 +790,31 @@ size_t OmniController::feedFlashStream(const uint8_t* data, size_t len,
                                        uint32_t timeoutMs) {
     if (!_flashStreamActive || _flashStream == nullptr) return 0;
     if (data == nullptr || len == 0) return 0;
-    return xStreamBufferSend(_flashStream, data, len, pdMS_TO_TICKS(timeoutMs));
+
+    // xStreamBufferSend with a non-zero timeout returns partial writes if
+    // the timeout expires before all bytes fit (e.g. the worker is stuck
+    // in flashBegin's ~2 s connect-with-stub and isn't draining yet, while
+    // the producer is feeding at network speed). Loop until either all
+    // bytes are pushed or `timeoutMs` total has elapsed with no progress.
+    //
+    // While this can briefly block AsyncTCP when the buffer fills, that's
+    // exactly what gives us natural TCP back-pressure: the upload sender
+    // throttles to match the C6's UART drain rate, no big buffer required.
+    size_t pushed = 0;
+    uint32_t deadline = millis() + timeoutMs;
+    while (pushed < len) {
+        uint32_t now = millis();
+        if (now >= deadline) break;
+        TickType_t remainingTicks = pdMS_TO_TICKS(deadline - now);
+        size_t got = xStreamBufferSend(_flashStream, data + pushed,
+                                       len - pushed, remainingTicks);
+        if (got == 0) {
+            // No progress within the remaining timeout — give up.
+            break;
+        }
+        pushed += got;
+    }
+    return pushed;
 }
 
 void OmniController::abortFlashStream() {
