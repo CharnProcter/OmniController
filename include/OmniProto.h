@@ -1,5 +1,9 @@
 #pragma once
 
+#include <cstdint>
+#include <cstddef>
+#include <cstring>
+
 // Wire protocol shared by S3 (OmniController) and C6 (OmniControllerC6Firmware).
 // This file is vendored verbatim into the C6 project. When the protocol changes,
 // bump OMNI_PROTO_VERSION and update both copies in lockstep — the CTRL `hello`
