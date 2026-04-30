@@ -279,6 +279,19 @@ void OmniUartFlasher::flashAbort() {
     _lastFlashMs = millis() - _flashStartMs;
     _lastFlashOk = false;
     _flashActive = false;
+
+    // Hard-reset the C6 so it falls out of stub mode. Without this, the
+    // stub keeps running indefinitely and the next flashBegin's
+    // connect_with_stub fails with "Software loader is resident at the
+    // requested address" — the SYNC reaches the still-running stub, and
+    // the stub refuses to load another stub on top of itself. Pulse EN
+    // here without holding BOOT so the C6 reboots into its app (or
+    // whatever its OTA partition currently points at) — the next
+    // flashBegin will drive BOOT low itself to re-enter ROM bootloader.
+    driveEnLow();
+    delay(50);
+    releaseEn();
+
     releaseStrapPins();
     recordAction(FlasherAction::None);
 }
