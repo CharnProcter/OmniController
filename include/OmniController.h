@@ -75,8 +75,20 @@ public:
     //
     // Lifecycle: startFlashStream → repeated feedFlashStream → worker
     // detects `received == size` and finalises automatically.
+    enum class FlashMode : uint8_t {
+        // Reset C6 into ROM bootloader, upload via UART using
+        // esp-serial-flasher. Bootstrap path; works even when the C6 isn't
+        // running our firmware. ~36 s for a 436 KB image.
+        Uart = 0,
+        // Stream the image to the running C6 firmware over the SPI link's
+        // OTA channel. Requires the link to be up (link.up=true). Faster
+        // than UART and doesn't require entering the bootloader. Lands in
+        // M-δ Push A onward.
+        Spi  = 1,
+    };
     bool startFlashStream(uint32_t imageSize, uint32_t flashOffset,
-                          uint32_t expectedCrc);
+                          uint32_t expectedCrc,
+                          FlashMode mode = FlashMode::Uart);
     size_t feedFlashStream(const uint8_t* data, size_t len, uint32_t timeoutMs);
     void abortFlashStream();
     bool flashStreamActive() const { return _flashStreamActive; }
@@ -144,6 +156,9 @@ private:
     void flashWorkerLoop();
     void finishFlashWorker(bool ok, int32_t errorCode, const char* msg);
 
+    void flashWorkerLoopUart(File& staged);
+    void flashWorkerLoopSpi(File& staged);
+
     fs::FS*              _fs              = nullptr;
     File                 _stagingFile;
     TaskHandle_t         _flashWorkerTask = nullptr;
@@ -151,6 +166,7 @@ private:
     volatile bool        _flashStreamActive   = false;
     volatile bool        _flashStreamAborted  = false;
     bool                 _flashStreamLinkWasRunning = false;
+    FlashMode            _flashStreamMode     = FlashMode::Uart;
     uint32_t             _flashStreamSize     = 0;
     uint32_t             _flashStreamOffset   = 0;
     uint32_t             _flashStreamExpectedCrc = 0;
@@ -163,4 +179,12 @@ private:
     uint32_t             _flashStreamDurationMs = 0;
     uint32_t             _flashStreamRunningCrc = 0;
     const char*          _flashStreamPhase = "idle";
+
+    // SPI-OTA response synchronisation. The frame handler (running on the
+    // SPI master task) sets these when ota_begin_ack / ota_status arrive
+    // and gives the semaphore so the flash worker can proceed.
+    SemaphoreHandle_t    _otaResponseSem = nullptr;
+    volatile bool        _otaResponseReady = false;
+    volatile uint32_t    _otaBytesAcked    = 0;
+    char                 _otaResponseReason[64] = {};
 };

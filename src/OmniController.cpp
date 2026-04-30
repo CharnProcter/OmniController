@@ -619,8 +619,26 @@ void OmniController::handleCtrlFrame(uint8_t /*flags*/, uint16_t /*seq*/,
             _link.last_pong_rtt_ms = (origTs && now >= origTs) ? (now - origTs) : 0;
             xSemaphoreGive(_linkMutex);
         }
+    } else if (strcmp(op, omni::ctrl::kOpOtaBeginAck) == 0) {
+        // C6 has received our ota_begin and reports readiness. Wake the
+        // SPI-OTA worker (which is blocked on _otaResponseSem).
+        bool ready = doc["ready"] | false;
+        const char* reason = doc["reason"] | "";
+        _otaResponseReady = ready;
+        strncpy(_otaResponseReason, reason, sizeof(_otaResponseReason) - 1);
+        _otaResponseReason[sizeof(_otaResponseReason) - 1] = '\0';
+        if (_otaResponseSem) xSemaphoreGive(_otaResponseSem);
+    } else if (strcmp(op, omni::ctrl::kOpOtaStatus) == 0) {
+        // Final status from C6 after ota_end. Wake the worker.
+        bool ok = doc["ok"] | false;
+        _otaBytesAcked = doc["bytes_received"] | 0u;
+        const char* err = doc["error"] | "";
+        _otaResponseReady = ok;
+        strncpy(_otaResponseReason, err, sizeof(_otaResponseReason) - 1);
+        _otaResponseReason[sizeof(_otaResponseReason) - 1] = '\0';
+        if (_otaResponseSem) xSemaphoreGive(_otaResponseSem);
     }
-    // Other CTRL ops (OTA, radio role changes) handled in later milestones.
+    // Other CTRL ops (radio role changes, etc.) handled in later milestones.
 }
 
 void OmniController::handleLogFrame(const uint8_t* payload, uint16_t payloadLen) {
@@ -703,7 +721,7 @@ void OmniController::ctrlPumpLoop() {
 // ── Streaming flash session (M-β.3) ────────────────────────────────────────
 
 bool OmniController::startFlashStream(uint32_t imageSize, uint32_t flashOffset,
-                                      uint32_t expectedCrc) {
+                                      uint32_t expectedCrc, FlashMode mode) {
     if (_flashStreamActive) {
         Serial.println("OmniController: flash stream already active");
         return false;
@@ -724,6 +742,16 @@ bool OmniController::startFlashStream(uint32_t imageSize, uint32_t flashOffset,
         Serial.println("OmniController: flash worker primitives not initialised (begin() must run first)");
         return false;
     }
+    if (mode == FlashMode::Spi) {
+        // SPI-OTA needs the link up — the C6 has to be running our firmware
+        // to receive the OTA stream. If the link is down, the caller should
+        // either bring it up (UART-flash a known-good image first) or use
+        // FlashMode::Uart to bootstrap.
+        if (!_link.hello_acked) {
+            Serial.println("OmniController: SPI-OTA refused — link is down (hello_ack not received)");
+            return false;
+        }
+    }
 
     // Open the staging file fresh — truncate any partial leftovers from
     // an aborted previous session.
@@ -737,6 +765,7 @@ bool OmniController::startFlashStream(uint32_t imageSize, uint32_t flashOffset,
     // Clear stale completion signal so a new wait starts from known state.
     xSemaphoreTake(_flashWorkerDone, 0);
 
+    _flashStreamMode           = mode;
     _flashStreamSize           = imageSize;
     _flashStreamOffset         = flashOffset;
     _flashStreamExpectedCrc    = expectedCrc;
@@ -751,13 +780,22 @@ bool OmniController::startFlashStream(uint32_t imageSize, uint32_t flashOffset,
     _flashStreamPhase          = "uploading";
     _flashStreamStartMs        = millis();
     _flashStreamActive         = true;
+    if (_otaResponseSem == nullptr) {
+        _otaResponseSem = xSemaphoreCreateBinary();
+    }
+    xSemaphoreTake(_otaResponseSem, 0);  // clear stale signal
+    _otaResponseReady = false;
+    _otaBytesAcked    = 0;
+    _otaResponseReason[0] = '\0';
     _flashStreamLinkWasRunning = false;  // we don't pause the SPI master
                                           // until the worker actually starts
                                           // flashing — keep the link alive
                                           // during the upload phase
 
-    Serial.printf("OmniController: flash stream started size=%u offset=0x%X (staging %s)\n",
-                  (unsigned)imageSize, (unsigned)flashOffset, kFlashStagePath);
+    Serial.printf("OmniController: flash stream started size=%u offset=0x%X mode=%s (staging %s)\n",
+                  (unsigned)imageSize, (unsigned)flashOffset,
+                  (mode == FlashMode::Spi) ? "spi" : "uart",
+                  kFlashStagePath);
     return true;
 }
 
@@ -787,9 +825,15 @@ size_t OmniController::feedFlashStream(const uint8_t* data, size_t len,
         _stagingFile.flush();
         _stagingFile.close();
 
-        // Pause the SPI master before the worker drives BOOT/HANDSHAKE.
-        _flashStreamLinkWasRunning = _spiMaster.taskRunning();
-        if (_flashStreamLinkWasRunning) _spiMaster.stop();
+        // UART mode pauses the SPI master so esp-serial-flasher can drive
+        // BOOT/HANDSHAKE. SPI-OTA mode KEEPS the master running — that's
+        // how we deliver the OTA bytes.
+        if (_flashStreamMode == FlashMode::Uart) {
+            _flashStreamLinkWasRunning = _spiMaster.taskRunning();
+            if (_flashStreamLinkWasRunning) _spiMaster.stop();
+        } else {
+            _flashStreamLinkWasRunning = false;  // never paused for SPI
+        }
 
         BaseType_t ok = xTaskCreatePinnedToCore(
             &OmniController::flashWorkerTrampoline,
@@ -850,6 +894,14 @@ void OmniController::flashWorkerLoop() {
         return;
     }
 
+    if (_flashStreamMode == FlashMode::Spi) {
+        flashWorkerLoopSpi(staged);
+    } else {
+        flashWorkerLoopUart(staged);
+    }
+}
+
+void OmniController::flashWorkerLoopUart(File& staged) {
     _flashStreamPhase = "connecting";
 
     // The worker owns the flash session for its lifetime. Open the C6
@@ -882,7 +934,6 @@ void OmniController::flashWorkerLoop() {
 
         int got = staged.read(block, toRead);
         if (got <= 0) {
-            // Premature EOF — staging file truncated unexpectedly.
             _flasher.flashAbort();
             staged.close();
             finishFlashWorker(false, -6, "staging_read_short");
@@ -899,11 +950,6 @@ void OmniController::flashWorkerLoop() {
         totalRead += (uint32_t)got;
         _flashStreamBytesFlashed = totalRead;
 
-        // Progress log every ~64 KB so the serial console (and anything
-        // tailing it) shows the flash is making forward progress. The
-        // worker takes ~36 s for a 436 KB image — without logs this looks
-        // like a hang. /omniC6Status pollers see the same data via
-        // session.bytes_flashed.
         if (totalRead - lastProgressLog >= 64 * 1024 || totalRead == _flashStreamSize) {
             Serial.printf("OmniController: flash %u/%u (%u%%)\n",
                           (unsigned)totalRead, (unsigned)_flashStreamSize,
@@ -915,12 +961,146 @@ void OmniController::flashWorkerLoop() {
     staged.close();
     _flashStreamPhase = "verifying";
 
-    // flashFinish handles MD5 verify + EN-pulse reset of the C6.
     if (!_flasher.flashFinish(true /*reboot*/)) {
         finishFlashWorker(false, _flasher.lastFlashError(), "flashFinish failed");
         return;
     }
 
+    finishFlashWorker(true, 0, "ok");
+}
+
+void OmniController::flashWorkerLoopSpi(File& staged) {
+    // Send ota_begin and wait for the C6 to acknowledge readiness. The
+    // CTRL frame handler (running on the SPI master task) gives
+    // _otaResponseSem when ota_begin_ack arrives; payload sets
+    // _otaResponseReady + reason.
+    _flashStreamPhase = "connecting";
+
+    {
+        JsonDocument doc;
+        doc["op"]     = omni::ctrl::kOpOtaBegin;
+        doc["size"]   = _flashStreamSize;
+        doc["offset"] = _flashStreamOffset;
+        // SHA-256 placeholder for Push A — Push B will compute + verify.
+        doc["sha256"] = "";
+        char buf[160];
+        size_t n = serializeJson(doc, buf, sizeof(buf));
+        xSemaphoreTake(_otaResponseSem, 0);  // clear stale
+        _otaResponseReady = false;
+        if (!_spiMaster.sendFrame(omni::Channel::Ctrl, omni::FlagAckReq,
+                                  _ctrlTxSeq++,
+                                  reinterpret_cast<const uint8_t*>(buf),
+                                  static_cast<uint16_t>(n))) {
+            staged.close();
+            finishFlashWorker(false, -10, "ota_begin_send_failed");
+            return;
+        }
+    }
+
+    // 5 s budget for the C6 to respond to ota_begin. If link is healthy
+    // this lands within ~50-100 ms (one SPI master cycle).
+    if (xSemaphoreTake(_otaResponseSem, pdMS_TO_TICKS(5000)) != pdTRUE) {
+        staged.close();
+        finishFlashWorker(false, -11, "ota_begin_timeout");
+        return;
+    }
+    if (!_otaResponseReady) {
+        Serial.printf("OmniController: ota_begin rejected: %s\n", _otaResponseReason);
+        staged.close();
+        finishFlashWorker(false, -12, "ota_begin_rejected");
+        return;
+    }
+
+    _flashStreamPhase = "flashing";
+    Serial.println("OmniController: SPI-OTA streaming start");
+
+    // Stream the staged file in kMaxPayload-sized chunks on the OTA channel.
+    // The SPI master's TX queue holds 8 frames; sendFrame returns false
+    // immediately when full. We back-pressure ourselves by sleeping until
+    // the queue drains.
+    static uint8_t chunk[omni::kMaxPayload];
+    uint32_t totalSent = 0;
+    uint32_t lastProgressLog = 0;
+    uint16_t otaSeq = 1;
+    while (totalSent < _flashStreamSize) {
+        if (_flashStreamAborted) {
+            staged.close();
+            finishFlashWorker(false, -2, "aborted");
+            return;
+        }
+
+        uint32_t toRead = _flashStreamSize - totalSent;
+        if (toRead > omni::kMaxPayload) toRead = omni::kMaxPayload;
+
+        int got = staged.read(chunk, toRead);
+        if (got <= 0) {
+            staged.close();
+            finishFlashWorker(false, -6, "staging_read_short");
+            return;
+        }
+
+        // Try to enqueue; if the master's TX queue is full, sleep briefly
+        // and retry. Each transaction takes ~20 ms (rate cap) so the queue
+        // drains predictably.
+        bool queued = false;
+        for (int attempt = 0; attempt < 100 && !queued; attempt++) {
+            queued = _spiMaster.sendFrame(omni::Channel::Ota, 0, otaSeq++,
+                                          chunk, (uint16_t)got);
+            if (!queued) vTaskDelay(pdMS_TO_TICKS(20));
+        }
+        if (!queued) {
+            staged.close();
+            finishFlashWorker(false, -13, "spi_tx_stuck");
+            return;
+        }
+
+        totalSent += (uint32_t)got;
+        _flashStreamBytesFlashed = totalSent;
+
+        if (totalSent - lastProgressLog >= 64 * 1024 || totalSent == _flashStreamSize) {
+            Serial.printf("OmniController: SPI-OTA %u/%u (%u%%)\n",
+                          (unsigned)totalSent, (unsigned)_flashStreamSize,
+                          (unsigned)((uint64_t)totalSent * 100 / _flashStreamSize));
+            lastProgressLog = totalSent;
+        }
+    }
+    staged.close();
+
+    // Wait for the master's TX queue to drain so the C6 has actually seen
+    // every byte before we send ota_end. Without this the end could
+    // overtake the last data frames.
+    vTaskDelay(pdMS_TO_TICKS(200));
+
+    // Send ota_end and wait for the C6's ota_status reply.
+    _flashStreamPhase = "verifying";
+    {
+        JsonDocument doc;
+        doc["op"] = omni::ctrl::kOpOtaEnd;
+        char buf[64];
+        size_t n = serializeJson(doc, buf, sizeof(buf));
+        xSemaphoreTake(_otaResponseSem, 0);
+        _otaResponseReady = false;
+        if (!_spiMaster.sendFrame(omni::Channel::Ctrl, omni::FlagAckReq,
+                                  _ctrlTxSeq++,
+                                  reinterpret_cast<const uint8_t*>(buf),
+                                  static_cast<uint16_t>(n))) {
+            finishFlashWorker(false, -14, "ota_end_send_failed");
+            return;
+        }
+    }
+    if (xSemaphoreTake(_otaResponseSem, pdMS_TO_TICKS(10000)) != pdTRUE) {
+        finishFlashWorker(false, -15, "ota_status_timeout");
+        return;
+    }
+    if (!_otaResponseReady) {
+        Serial.printf("OmniController: ota_status reports failure: %s (acked=%u)\n",
+                      _otaResponseReason, (unsigned)_otaBytesAcked);
+        finishFlashWorker(false, -16, "ota_failed");
+        return;
+    }
+
+    Serial.printf("OmniController: SPI-OTA ok (C6 received %u bytes)\n",
+                  (unsigned)_otaBytesAcked);
     finishFlashWorker(true, 0, "ok");
 }
 
