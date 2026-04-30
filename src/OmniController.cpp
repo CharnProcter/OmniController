@@ -496,7 +496,11 @@ bool OmniController::handleSerialFlashCommand(const String& line) {
     uint32_t lastProgressLog = 0;
 
     while (received < size) {
-        if (millis() - lastByteMs > 15000) {
+        // 30 s inter-byte timeout. We've seen Windows' USB-CDC driver leave
+        // the last few KB of a transfer stuck in its kernel buffer for
+        // tens of seconds before pushing them across; tighter timeouts
+        // surface as spurious rx_timeout near the very end of the stream.
+        if (millis() - lastByteMs > 30000) {
             _flasher.flashAbort();
             Serial.printf("OMNI_C6_FLASH_ERR rx_timeout %u_of_%u\n",
                           (unsigned)received, (unsigned)size);
