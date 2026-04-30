@@ -181,14 +181,29 @@ void OmniController::registerEndpoints(FlexibleEndpoints* endpoints) {
                      "transaction since SPI is full-duplex but the slave only "
                      "knows what to echo after the first transaction completes). "
                      "Returns the round-trip details as JSON; payload_text "
-                     "should read 'echo: <orig>' on success.")
+                     "should read 'echo: <orig>' on success. Diagnostic fields "
+                     "rx1_hex / rx2_hex show the first 32 bytes received on each "
+                     "transaction — useful when frame_valid is false.")
         .params({})
         .responseType(JSON_RESPONSE)
         .responseDescription("JSON with sent/received seq, payload, validity")
         .handler([self](std::map<String, String>& /*params*/) -> std::pair<String, int> {
             static uint16_t seq = 1;
             static uint8_t txBuf[omni::kSpiTransactionBytes];
-            static uint8_t rxBuf[omni::kSpiTransactionBytes];
+            static uint8_t rx1Buf[omni::kSpiTransactionBytes];
+            static uint8_t rx2Buf[omni::kSpiTransactionBytes];
+
+            auto hexDump = [](const uint8_t* buf, size_t n) {
+                String s;
+                s.reserve(n * 3);
+                for (size_t i = 0; i < n; i++) {
+                    char hex[4];
+                    snprintf(hex, sizeof(hex), "%02x ", buf[i]);
+                    s += hex;
+                }
+                if (s.length()) s.remove(s.length() - 1);  // trim trailing space
+                return s;
+            };
 
             const char* msg = "echo-test";
             const uint16_t msgLen = static_cast<uint16_t>(strlen(msg));
@@ -203,10 +218,14 @@ void OmniController::registerEndpoints(FlexibleEndpoints* endpoints) {
                 return std::pair<String, int>(
                     String("{\"ok\":false,\"error\":\"encode_failed\"}"), 500);
             }
-            if (!self->_spiMaster.transact(txBuf, rxBuf)) {
+            if (!self->_spiMaster.transact(txBuf, rx1Buf)) {
                 return std::pair<String, int>(
                     String("{\"ok\":false,\"error\":\"transact_1_failed\"}"), 500);
             }
+
+            // Small delay to give the C6 time to decode T1 and queue the echo
+            // for T2. SpiSlaveTask runs in its own task so this is generous.
+            delay(20);
 
             // Transaction 2: send another ping (so the slave clocks data), receive
             // the echo of transaction 1's payload from the slave's TX buffer.
@@ -219,17 +238,29 @@ void OmniController::registerEndpoints(FlexibleEndpoints* endpoints) {
                 return std::pair<String, int>(
                     String("{\"ok\":false,\"error\":\"encode_2_failed\"}"), 500);
             }
-            if (!self->_spiMaster.transact(txBuf, rxBuf)) {
+            if (!self->_spiMaster.transact(txBuf, rx2Buf)) {
                 return std::pair<String, int>(
                     String("{\"ok\":false,\"error\":\"transact_2_failed\"}"), 500);
             }
 
             JsonDocument doc;
-            doc["sent_seq"]   = seq;
+            doc["sent_seq"]     = seq;
             doc["sent_payload"] = msg;
+            doc["rx1_hex"]      = hexDump(rx1Buf, 32);
+            doc["rx2_hex"]      = hexDump(rx2Buf, 32);
+
+            // Quick "is anything alive on MISO" check
+            bool rx2_all_ones = true, rx2_all_zeros = true;
+            for (size_t i = 0; i < 32; i++) {
+                if (rx2Buf[i] != 0xFF) rx2_all_ones = false;
+                if (rx2Buf[i] != 0x00) rx2_all_zeros = false;
+            }
+            if (rx2_all_ones)  doc["miso_state"] = "all_0xFF (slave silent or MISO floating high)";
+            else if (rx2_all_zeros) doc["miso_state"] = "all_0x00 (slave silent or MISO pulled low)";
+            else doc["miso_state"] = "varied (slave is sending bytes)";
 
             omni::DecodedFrame d{};
-            const bool ok = omni::decodeFrame(rxBuf, sizeof(rxBuf), d);
+            const bool ok = omni::decodeFrame(rx2Buf, sizeof(rx2Buf), d);
             doc["frame_valid"] = ok;
             if (ok) {
                 doc["echoed_channel"] = static_cast<uint8_t>(d.channel);
