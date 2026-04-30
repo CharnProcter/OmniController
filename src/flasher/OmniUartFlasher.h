@@ -37,6 +37,11 @@ struct ProbeResult {
 
 class OmniUartFlasher {
 public:
+    // esp-serial-flasher enforces size <= block_size on every esp_loader_flash_write
+    // call. Callers feeding bytes from another source (USB-CDC, HTTP) must cap
+    // their per-call chunk at this value to avoid ESP_LOADER_ERROR_INVALID_PARAM.
+    static constexpr uint32_t kBlockSize = 2048;
+
     void begin(uint8_t enPin, uint8_t bootPin, uint8_t uartTxPin, uint8_t uartRxPin);
 
     // Pulse EN low to reset the C6 into normal application mode.

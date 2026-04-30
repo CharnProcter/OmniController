@@ -480,11 +480,16 @@ bool OmniController::handleSerialFlashCommand(const String& line) {
 
     // Streaming pipeline: read a chunk from USB-CDC, accumulate CRC32, hand
     // straight to flashWrite. No buffering of the whole image — works without
-    // PSRAM and keeps the stack budget tiny. USB-CDC backpressures the host
-    // so the host's send rate naturally matches our flashWrite throughput
-    // (~46 KB/s at 460800 baud once the stub is loaded).
-    constexpr uint32_t kChunkSize = 4096;
-    static uint8_t chunk[kChunkSize];   // static to keep it off a small task stack
+    // PSRAM and keeps the stack budget tiny.
+    //
+    // Critical: esp-serial-flasher's esp_loader_flash_write requires size to
+    // be <= block_size set by flash_start. We cap toRead at OmniUartFlasher's
+    // kBlockSize so we never exceed it, regardless of how much Serial happens
+    // to have buffered. Earlier we used a 4096-byte chunk independent of the
+    // block size and got ESP_LOADER_ERROR_INVALID_PARAM (and MD5 mismatches
+    // when partial-block bookkeeping desynced).
+    constexpr uint32_t kChunkSize = omni::OmniUartFlasher::kBlockSize;
+    static uint8_t chunk[kChunkSize];
     uint32_t runningCrc = 0;
     uint32_t received = 0;
     uint32_t lastByteMs = millis();
