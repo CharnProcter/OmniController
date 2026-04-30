@@ -17,7 +17,9 @@ constexpr uint32_t kPostReleaseMs  = 20;   // settle time after releasing strap 
 constexpr uart_port_t kFlasherUartPort = UART_NUM_1;
 constexpr uint32_t   kFlasherBaudRate  = 115200;
 constexpr uint32_t   kFlasherFastBaud  = 460800;  // post-stub bump for throughput
-constexpr uint32_t   kFlasherBlockSize = 4096;    // stub block; ROM mode is limited to 1024
+constexpr uint32_t   kFlasherBlockSize = 2048;    // halved from 4096 to reduce stub buffer
+                                                   // pressure after intermittent transit
+                                                   // corruption surfaced via flash_verify
 
 const char* targetName(target_chip_t t) {
     switch (t) {
