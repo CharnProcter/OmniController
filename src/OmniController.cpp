@@ -36,6 +36,36 @@ bool OmniController::begin(FlexibleEndpoints* endpoints, const OmniPins& pins) {
     xTaskCreatePinnedToCore(&OmniController::ctrlPumpTrampoline,
                             "OmniCtrlPump", 4096, this, 4, &_ctrlPumpTask, 1);
 
+    // M-β.3: pre-allocate the flash-stream storage now, while heap is
+    // fresh and contiguous. Lazy-allocating at upload time was failing
+    // because by then the heap is fragmented (WiFi state, AsyncWebServer
+    // connection pool, WS clients) and contiguous blocks even at 64 KB
+    // can be unobtainable. Try PSRAM first via heap_caps_malloc — if that
+    // fails (PSRAM not configured for malloc), fall back to internal RAM.
+    {
+        static StaticStreamBuffer_t sFlashStreamMgmt;
+        uint8_t* storage = static_cast<uint8_t*>(
+            heap_caps_malloc(kFlashStreamCapacity, MALLOC_CAP_SPIRAM));
+        const char* loc = "PSRAM";
+        if (storage == nullptr) {
+            storage = static_cast<uint8_t*>(
+                heap_caps_malloc(kFlashStreamCapacity, MALLOC_CAP_8BIT));
+            loc = "internal";
+        }
+        if (storage == nullptr) {
+            Serial.printf("OmniController: flash stream %u KB alloc failed (heap=%u largest=%u)\n",
+                          (unsigned)(kFlashStreamCapacity / 1024),
+                          (unsigned)heap_caps_get_free_size(MALLOC_CAP_8BIT),
+                          (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
+        } else {
+            _flashStream = xStreamBufferCreateStatic(
+                kFlashStreamCapacity, kFlashStreamTrigger, storage, &sFlashStreamMgmt);
+            Serial.printf("OmniController: flash stream %u KB in %s @ %p\n",
+                          (unsigned)(kFlashStreamCapacity / 1024), loc, storage);
+        }
+        _flashWorkerDone = xSemaphoreCreateBinary();
+    }
+
     if (endpoints) {
         registerEndpoints(endpoints);
     }
@@ -677,13 +707,16 @@ void OmniController::ctrlPumpLoop() {
 
 namespace {
 // Stream buffer between producer (HTTP upload callback or USB-CDC reader)
-// and the worker task. Sized to hold an entire C6 image (typical merged
-// bundle is ~440 KB) so the producer never back-pressures — earlier 32 KB
-// buffer + 1 s timeout returned partial writes during the first 2 s of
-// flashBegin (worker blocked, buffer filled at network speed, timeout
-// fired before the worker started draining). 1 MB in PSRAM is cheap on
-// the S3 (8 MB available) and removes the failure mode entirely.
-constexpr size_t kFlashStreamCapacity = 1 * 1024 * 1024;
+// and the worker task. Sized large enough to absorb the network burst
+// during the ~2 s flashBegin window where the worker is busy and can't
+// drain. 128 KB internal RAM gives us ~10 s of UART-drain headroom at
+// 12 KB/s, which beats any realistic flashBegin duration.
+//
+// Allocation happens once at begin() (heap is fresh) and the buffer is
+// reused across sessions. Earlier attempts to lazy-create at session
+// start failed because by upload time the heap was fragmented and even
+// 64 KB contiguous internal couldn't be obtained, let alone 1 MB PSRAM.
+constexpr size_t kFlashStreamCapacity = 128 * 1024;
 constexpr size_t kFlashStreamTrigger  = 1;  // wake worker on any byte
 constexpr uint32_t kFlashWorkerStackBytes = 8192;
 constexpr UBaseType_t kFlashWorkerPriority = 5;
@@ -705,34 +738,10 @@ bool OmniController::startFlashStream(uint32_t imageSize, uint32_t flashOffset,
         return false;
     }
 
-    // Lazy-init the stream buffer + completion semaphore. They persist
-    // across sessions (cheaper than recreating them every time). The
-    // storage byte array goes in PSRAM — at 1 MB it's too large for
-    // internal RAM, and xStreamBufferCreate's default allocator only
-    // pulls from internal heap. xStreamBufferCreateStatic lets us hand
-    // it a PSRAM-allocated storage block.
-    if (_flashStream == nullptr) {
-        static StaticStreamBuffer_t sStreamMgmt;
-        uint8_t* storage = static_cast<uint8_t*>(
-            heap_caps_malloc(kFlashStreamCapacity, MALLOC_CAP_SPIRAM));
-        if (storage == nullptr) {
-            // Fall back to internal RAM with a smaller buffer if PSRAM is
-            // somehow unavailable. 64 KB still beats the previous 32 KB
-            // and avoids the back-pressure failure for typical uploads.
-            Serial.println("OmniController: PSRAM alloc failed, falling back to 64 KB internal");
-            _flashStream = xStreamBufferCreate(64 * 1024, kFlashStreamTrigger);
-        } else {
-            _flashStream = xStreamBufferCreateStatic(
-                kFlashStreamCapacity, kFlashStreamTrigger, storage, &sStreamMgmt);
-            Serial.printf("OmniController: flash stream %u KB in PSRAM @ %p\n",
-                          (unsigned)(kFlashStreamCapacity / 1024), storage);
-        }
-    }
-    if (_flashWorkerDone == nullptr) {
-        _flashWorkerDone = xSemaphoreCreateBinary();
-    }
+    // Stream buffer + completion semaphore are allocated once in begin()
+    // when the heap is fresh — see the note in begin() for why.
     if (_flashStream == nullptr || _flashWorkerDone == nullptr) {
-        Serial.println("OmniController: flash stream alloc failed");
+        Serial.println("OmniController: flash stream not initialised (begin() must run first)");
         return false;
     }
 
