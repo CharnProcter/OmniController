@@ -113,6 +113,12 @@ private:
         uint32_t last_pong_rtt_ms = 0;
         uint32_t last_log_ms      = 0;
         uint32_t log_lines        = 0;
+        // Reported by the C6 in hello_ack (M-δ Push B). True between an
+        // OTA-triggered reboot and the moment the C6 calls
+        // esp_ota_mark_app_valid_cancel_rollback (which it does right after
+        // queuing the hello_ack itself). Lets the dashboard show the
+        // verifying → valid transition.
+        bool     c6_pending_verify = false;
     };
 
     void registerEndpoints(FlexibleEndpoints* endpoints);
@@ -187,4 +193,9 @@ private:
     volatile bool        _otaResponseReady = false;
     volatile uint32_t    _otaBytesAcked    = 0;
     char                 _otaResponseReason[64] = {};
+
+    // SHA-256 of the staged image, hex-encoded. Computed at the top of
+    // flashWorkerLoopSpi and sent in the ota_begin JSON; the C6 verifies
+    // its incoming-byte digest against this on ota_end.
+    char                 _otaSha256Hex[65] = {};
 };

@@ -3,6 +3,7 @@
 #include <ArduinoJson.h>
 #include <esp_rom_crc.h>
 #include "driver/uart.h"
+#include "mbedtls/md.h"
 
 #include "OmniProto.h"
 
@@ -65,7 +66,7 @@ bool OmniController::begin(FlexibleEndpoints* endpoints, const OmniPins& pins) {
     }
 
     _began = true;
-    Serial.println("OmniController: initialized (M-gamma.C)");
+    Serial.println("OmniController: initialized (M-delta.B)");
     return true;
 }
 
@@ -109,7 +110,7 @@ void OmniController::registerEndpoints(FlexibleEndpoints* endpoints) {
             doc["fw"] = OMNI_S3_FW_VERSION;
             doc["proto"] = OMNI_PROTO_VERSION;
             doc["began"] = self->_began;
-            doc["milestone"] = "M-gamma.C";
+            doc["milestone"] = "M-delta.B";
             JsonArray drivers = doc["drivers"].to<JsonArray>();
             (void)drivers;  // populated as drivers register in M-zeta+
             String out;
@@ -198,6 +199,7 @@ void OmniController::registerEndpoints(FlexibleEndpoints* endpoints) {
             link["up"]               = ls.hello_acked;
             link["c6_proto"]         = ls.c6_proto;
             link["c6_fw"]            = (const char*)ls.c6_fw;
+            link["c6_pending_verify"] = ls.c6_pending_verify;
             link["hello_attempts"]   = ls.hello_attempts;
             link["last_pong_ms_ago"] = (ls.last_pong_ms == 0) ? (uint32_t)0 : (now - ls.last_pong_ms);
             link["last_pong_rtt_ms"] = ls.last_pong_rtt_ms;
@@ -596,20 +598,23 @@ void OmniController::handleCtrlFrame(uint8_t /*flags*/, uint16_t /*seq*/,
 
     if (strcmp(op, omni::ctrl::kOpHelloAck) == 0) {
         bool firstUp = false;
+        bool pendingVerify = doc["pending_verify"] | false;
         if (_linkMutex && xSemaphoreTake(_linkMutex, portMAX_DELAY) == pdTRUE) {
             firstUp = !_link.hello_acked;
             _link.hello_acked    = true;
             _link.hello_acked_ms = millis();
             _link.c6_proto       = doc["proto"] | -1;
+            _link.c6_pending_verify = pendingVerify;
             const char* fw = doc["fw"] | "";
             strncpy(_link.c6_fw, fw, sizeof(_link.c6_fw) - 1);
             _link.c6_fw[sizeof(_link.c6_fw) - 1] = '\0';
             xSemaphoreGive(_linkMutex);
         }
         if (firstUp) {
-            Serial.printf("OmniController: link UP (c6_proto=%d c6_fw=%s)\n",
+            Serial.printf("OmniController: link UP (c6_proto=%d c6_fw=%s%s)\n",
                           (int)(doc["proto"] | -1),
-                          (const char*)(doc["fw"] | ""));
+                          (const char*)(doc["fw"] | ""),
+                          pendingVerify ? " PENDING_VERIFY" : "");
         }
     } else if (strcmp(op, omni::ctrl::kOpPong) == 0) {
         uint32_t origTs = doc["ts"] | 0u;
@@ -970,6 +975,58 @@ void OmniController::flashWorkerLoopUart(File& staged) {
 }
 
 void OmniController::flashWorkerLoopSpi(File& staged) {
+    // Pass 1: hash the staged file. The C6 streams the bytes back into a
+    // running mbedtls digest as they arrive on Channel::Ota and compares
+    // to this digest at ota_end — that's our authoritative verification.
+    _flashStreamPhase = "hashing";
+    {
+        mbedtls_md_context_t ctx;
+        mbedtls_md_init(&ctx);
+        const mbedtls_md_info_t* info = mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
+        if (info == nullptr ||
+            mbedtls_md_setup(&ctx, info, 0) != 0 ||
+            mbedtls_md_starts(&ctx) != 0) {
+            mbedtls_md_free(&ctx);
+            staged.close();
+            finishFlashWorker(false, -17, "sha_init_failed");
+            return;
+        }
+        static uint8_t shaBuf[2048];
+        uint32_t hashed = 0;
+        while (hashed < _flashStreamSize) {
+            uint32_t toRead = _flashStreamSize - hashed;
+            if (toRead > sizeof(shaBuf)) toRead = sizeof(shaBuf);
+            int got = staged.read(shaBuf, toRead);
+            if (got <= 0) break;
+            if (mbedtls_md_update(&ctx, shaBuf, (size_t)got) != 0) {
+                mbedtls_md_free(&ctx);
+                staged.close();
+                finishFlashWorker(false, -17, "sha_update_failed");
+                return;
+            }
+            hashed += (uint32_t)got;
+        }
+        uint8_t digest[32];
+        int finOk = mbedtls_md_finish(&ctx, digest);
+        mbedtls_md_free(&ctx);
+        if (finOk != 0 || hashed != _flashStreamSize) {
+            staged.close();
+            finishFlashWorker(false, -17, "sha_finish_failed");
+            return;
+        }
+        for (int i = 0; i < 32; i++) {
+            sprintf(_otaSha256Hex + i * 2, "%02x", digest[i]);
+        }
+        _otaSha256Hex[64] = '\0';
+        Serial.printf("OmniController: SPI-OTA staged sha256=%s\n", _otaSha256Hex);
+    }
+    // Rewind for the streaming pass below — same File handle is reused.
+    if (!staged.seek(0)) {
+        staged.close();
+        finishFlashWorker(false, -17, "staging_seek_failed");
+        return;
+    }
+
     // Send ota_begin and wait for the C6 to acknowledge readiness. The
     // CTRL frame handler (running on the SPI master task) gives
     // _otaResponseSem when ota_begin_ack arrives; payload sets
@@ -981,9 +1038,8 @@ void OmniController::flashWorkerLoopSpi(File& staged) {
         doc["op"]     = omni::ctrl::kOpOtaBegin;
         doc["size"]   = _flashStreamSize;
         doc["offset"] = _flashStreamOffset;
-        // SHA-256 placeholder for Push A — Push B will compute + verify.
-        doc["sha256"] = "";
-        char buf[160];
+        doc["sha256"] = _otaSha256Hex;
+        char buf[200];
         size_t n = serializeJson(doc, buf, sizeof(buf));
         xSemaphoreTake(_otaResponseSem, 0);  // clear stale
         _otaResponseReady = false;
@@ -1099,7 +1155,19 @@ void OmniController::flashWorkerLoopSpi(File& staged) {
         return;
     }
 
-    Serial.printf("OmniController: SPI-OTA ok (C6 received %u bytes)\n",
+    // C6 reports success and is about to reboot itself (~500 ms after it
+    // queued the status frame). Clear hello_acked so the pump task re-runs
+    // the handshake against the just-booted (and possibly differently-
+    // versioned) image — that handshake is also what triggers the C6's
+    // PENDING_VERIFY → VALID promotion.
+    if (_linkMutex && xSemaphoreTake(_linkMutex, portMAX_DELAY) == pdTRUE) {
+        _link.hello_acked = false;
+        _link.c6_proto    = -1;
+        _link.c6_fw[0]    = '\0';
+        xSemaphoreGive(_linkMutex);
+    }
+
+    Serial.printf("OmniController: SPI-OTA ok (C6 received %u bytes — rebooting into new image)\n",
                   (unsigned)_otaBytesAcked);
     finishFlashWorker(true, 0, "ok");
 }
