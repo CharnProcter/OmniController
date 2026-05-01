@@ -975,6 +975,51 @@ void OmniController::flashWorkerLoopUart(File& staged) {
 }
 
 void OmniController::flashWorkerLoopSpi(File& staged) {
+    // Pass 0: sniff the image format. SPI-OTA writes straight into the
+    // C6's inactive OTA partition — which means the staged file MUST be
+    // an app-only image (e.g. .pio/build/c6/firmware.bin), NOT the merged
+    // bundle (bootloader+partitions+app, the c6_merged.bin used for
+    // UART-mode bootstrap). If we let a merged bundle through, ota_0
+    // gets the bootloader's bytes at offset 0, and esp_ota_end fails
+    // verification with "Failed to fetch app description header". Catch
+    // it here with a clear message instead.
+    {
+        constexpr uint32_t kEspAppDescMagic = 0xABCD5432;
+        uint8_t hdr[36] = {};
+        int got = staged.read(hdr, sizeof(hdr));
+        if (got != (int)sizeof(hdr)) {
+            staged.close();
+            finishFlashWorker(false, -18, "image_too_small");
+            return;
+        }
+        if (hdr[0] != 0xE9) {
+            staged.close();
+            finishFlashWorker(false, -18, "not_esp_image");
+            return;
+        }
+        uint32_t appDescMagic =
+            (uint32_t)hdr[32]        |
+            ((uint32_t)hdr[33] << 8)  |
+            ((uint32_t)hdr[34] << 16) |
+            ((uint32_t)hdr[35] << 24);
+        if (appDescMagic != kEspAppDescMagic) {
+            Serial.printf("OmniController: SPI-OTA refused — staged file at offset 0x20 "
+                          "is 0x%08X, expected esp_app_desc magic 0x%08X. "
+                          "Looks like a merged bundle (bootloader+partitions+app); "
+                          "SPI-OTA needs the app-only firmware.bin. Use UART mode "
+                          "for c6_merged.bin.\n",
+                          (unsigned)appDescMagic, (unsigned)kEspAppDescMagic);
+            staged.close();
+            finishFlashWorker(false, -18, "merged_bundle_in_spi_mode");
+            return;
+        }
+        if (!staged.seek(0)) {
+            staged.close();
+            finishFlashWorker(false, -17, "staging_seek_failed");
+            return;
+        }
+    }
+
     // Pass 1: hash the staged file. The C6 streams the bytes back into a
     // running mbedtls digest as they arrive on Channel::Ota and compares
     // to this digest at ota_end — that's our authoritative verification.
