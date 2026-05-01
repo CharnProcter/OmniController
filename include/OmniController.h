@@ -119,6 +119,17 @@ private:
         // queuing the hello_ack itself). Lets the dashboard show the
         // verifying → valid transition.
         bool     c6_pending_verify = false;
+        // Reported by the C6 in thread_status_reply (M-θ Push A). The role
+        // string is the OpenThread-canonical name ("disabled", "detached",
+        // "child", "router", "leader", or "uninit" if the stack didn't come
+        // up). thread_has_dataset reports whether NVS holds a committed
+        // operational dataset, telling us whether OThread.start() in
+        // Push B will rejoin or sit detached.
+        bool     thread_stack_started = false;
+        int32_t  thread_role          = 0;     // ot_device_role_t or 0xFF/-1 if unknown
+        char     thread_role_str[16]  = {};
+        bool     thread_has_dataset   = false;
+        uint32_t thread_last_status_ms = 0;
     };
 
     void registerEndpoints(FlexibleEndpoints* endpoints);
@@ -141,6 +152,7 @@ private:
     void handleLogFrame(const uint8_t* payload, uint16_t payloadLen);
     void sendHello();
     void sendPing();
+    void sendThreadStatusQuery();
     static void ctrlPumpTrampoline(void* arg);
     void ctrlPumpLoop();
 

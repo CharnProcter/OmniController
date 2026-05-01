@@ -52,7 +52,8 @@ enum FrameFlag : uint8_t {
 };
 
 // CTRL channel ops (JSON `op` field). Listed here so both sides agree on names;
-// handlers land in M-γ (link bring-up), M-δ (OTA), M-κ (radio roles).
+// handlers land in M-γ (link bring-up), M-δ (OTA), M-θ (Thread / Matter),
+// M-κ (radio roles).
 namespace ctrl {
 constexpr const char* kOpHello          = "hello";
 constexpr const char* kOpHelloAck       = "hello_ack";
@@ -67,6 +68,13 @@ constexpr const char* kOpReset          = "reset";
 constexpr const char* kOpBootloader     = "bootloader";
 constexpr const char* kOpResync         = "resync";
 constexpr const char* kOpLogSubscribe   = "log_subscribe";
+
+// Thread (M-θ Push A). thread_status is request-only from S3; the C6
+// replies with thread_status_reply containing role, stack state, dataset
+// presence. Network bring-up ops (thread_enable / thread_disable) land
+// in Push B once we're ready to commit datasets.
+constexpr const char* kOpThreadStatus      = "thread_status";
+constexpr const char* kOpThreadStatusReply = "thread_status_reply";
 
 // Dynamic radio roles (M-κ). The C6 carries WiFi 6 + BLE 5 + 802.15.4 on a
 // single 2.4 GHz front-end. Default role is 802154_only; the S3 can ask the

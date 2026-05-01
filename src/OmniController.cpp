@@ -66,7 +66,7 @@ bool OmniController::begin(FlexibleEndpoints* endpoints, const OmniPins& pins) {
     }
 
     _began = true;
-    Serial.println("OmniController: initialized (M-delta.B)");
+    Serial.println("OmniController: initialized (M-theta.A)");
     return true;
 }
 
@@ -110,7 +110,7 @@ void OmniController::registerEndpoints(FlexibleEndpoints* endpoints) {
             doc["fw"] = OMNI_S3_FW_VERSION;
             doc["proto"] = OMNI_PROTO_VERSION;
             doc["began"] = self->_began;
-            doc["milestone"] = "M-delta.B";
+            doc["milestone"] = "M-theta.A";
             JsonArray drivers = doc["drivers"].to<JsonArray>();
             (void)drivers;  // populated as drivers register in M-zeta+
             String out;
@@ -205,6 +205,17 @@ void OmniController::registerEndpoints(FlexibleEndpoints* endpoints) {
             link["last_pong_rtt_ms"] = ls.last_pong_rtt_ms;
             link["log_lines"]        = ls.log_lines;
             link["last_log_ms_ago"]  = (ls.last_log_ms == 0) ? (uint32_t)0 : (now - ls.last_log_ms);
+
+            // M-θ Push A: Thread stack snapshot from the C6's last
+            // thread_status_reply. Empty until the first reply arrives.
+            JsonObject thread = link["thread"].to<JsonObject>();
+            thread["stack_started"]    = ls.thread_stack_started;
+            thread["role"]             = ls.thread_role;
+            thread["role_str"]         = (const char*)ls.thread_role_str;
+            thread["has_dataset"]      = ls.thread_has_dataset;
+            thread["last_status_ms_ago"] =
+                (ls.thread_last_status_ms == 0) ? (uint32_t)0
+                                                : (now - ls.thread_last_status_ms);
 
             String out;
             serializeJson(doc, out);
@@ -642,6 +653,22 @@ void OmniController::handleCtrlFrame(uint8_t /*flags*/, uint16_t /*seq*/,
         strncpy(_otaResponseReason, err, sizeof(_otaResponseReason) - 1);
         _otaResponseReason[sizeof(_otaResponseReason) - 1] = '\0';
         if (_otaResponseSem) xSemaphoreGive(_otaResponseSem);
+    } else if (strcmp(op, omni::ctrl::kOpThreadStatusReply) == 0) {
+        // M-θ Push A: snapshot the C6's Thread stack state. ctrlPumpLoop
+        // sends a thread_status every ~10 s; we just stash the latest reply.
+        bool stackStarted = doc["stack_started"] | false;
+        int  threadRole   = doc["role"]          | 0;
+        const char* roleStr = doc["role_str"]    | "";
+        bool hasDataset   = doc["has_dataset"]   | false;
+        if (_linkMutex && xSemaphoreTake(_linkMutex, portMAX_DELAY) == pdTRUE) {
+            _link.thread_stack_started = stackStarted;
+            _link.thread_role          = threadRole;
+            _link.thread_has_dataset   = hasDataset;
+            strncpy(_link.thread_role_str, roleStr, sizeof(_link.thread_role_str) - 1);
+            _link.thread_role_str[sizeof(_link.thread_role_str) - 1] = '\0';
+            _link.thread_last_status_ms = millis();
+            xSemaphoreGive(_linkMutex);
+        }
     }
     // Other CTRL ops (radio role changes, etc.) handled in later milestones.
 }
@@ -698,6 +725,17 @@ void OmniController::sendPing() {
                          static_cast<uint16_t>(n));
 }
 
+void OmniController::sendThreadStatusQuery() {
+    JsonDocument doc;
+    doc["op"] = omni::ctrl::kOpThreadStatus;
+    char buf[64];
+    size_t n = serializeJson(doc, buf, sizeof(buf));
+    if (n == 0) return;
+    _spiMaster.sendFrame(omni::Channel::Ctrl, 0, _ctrlTxSeq++,
+                         reinterpret_cast<const uint8_t*>(buf),
+                         static_cast<uint16_t>(n));
+}
+
 void OmniController::ctrlPumpTrampoline(void* arg) {
     static_cast<OmniController*>(arg)->ctrlPumpLoop();
     vTaskDelete(nullptr);
@@ -707,6 +745,7 @@ void OmniController::ctrlPumpLoop() {
     // Initial 250 ms grace so the SPI master task and the C6's slave task
     // both reach steady state before we start probing the link.
     vTaskDelay(pdMS_TO_TICKS(250));
+    uint32_t pingTickCount = 0;
     while (true) {
         bool acked = false;
         if (_linkMutex && xSemaphoreTake(_linkMutex, portMAX_DELAY) == pdTRUE) {
@@ -715,9 +754,16 @@ void OmniController::ctrlPumpLoop() {
         }
         if (!acked) {
             sendHello();
+            pingTickCount = 0;  // restart cadence after each rebring-up
             vTaskDelay(pdMS_TO_TICKS(1000));
         } else {
             sendPing();
+            // thread_status query rides the pong cadence — every other ping
+            // (so ~10 s) we also poll Thread state. Cheap on the wire (one
+            // CTRL frame per 10 s), and it's how the dashboard sees role
+            // transitions once Push B starts forming networks.
+            if ((pingTickCount % 2) == 0) sendThreadStatusQuery();
+            pingTickCount++;
             vTaskDelay(pdMS_TO_TICKS(5000));
         }
     }
